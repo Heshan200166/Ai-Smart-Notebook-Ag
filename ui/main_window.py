@@ -366,13 +366,17 @@ class MainWindow(QMainWindow):
             if pos:
                 # Check if finger is in the header UI area
                 if pos[1] > self.HEADER_HEIGHT:
+                    self.drawing_engine.set_eraser(False)
                     self.drawing_engine.draw(pos[0], pos[1])
+                else:
+                    self.drawing_engine.stop_drawing()
         elif gesture == Gesture.ERASE:
             pos = self.hand_tracker.get_fingertip_position(2)  # Middle finger
             if pos and pos[1] > self.HEADER_HEIGHT:
                 self.drawing_engine.set_eraser(True)
                 self.drawing_engine.draw(pos[0], pos[1])
-                self.drawing_engine.set_eraser(False)
+            else:
+                self.drawing_engine.stop_drawing()
         elif gesture == Gesture.SELECT:
             pos = self.hand_tracker.get_fingertip_position(1)  # Index finger
             if pos and pos[1] <= self.HEADER_HEIGHT:
@@ -417,7 +421,7 @@ class MainWindow(QMainWindow):
     # =========================================================================
 
     def _draw_hud(self, frame, gesture):
-        """Draw the on-screen header bar with color palette and tools."""
+        """Draw the on-screen header bar with color palette, tools, and debug info."""
         h, w = frame.shape[:2]
 
         # Semi-transparent header background
@@ -458,6 +462,24 @@ class MainWindow(QMainWindow):
         text_size = cv2.getTextSize(hint, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)[0]
         cv2.putText(frame, hint, (w - text_size[0] - 20, 45),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 200), 1, cv2.LINE_AA)
+
+        # --- Finger state debug overlay (bottom-left) ---
+        finger_states = self.hand_tracker.get_finger_states()
+        finger_labels = ["THM", "IDX", "MID", "RNG", "PNK"]
+        debug_y = h - 40
+        debug_x = 20
+
+        # Background
+        overlay2 = frame.copy()
+        cv2.rectangle(overlay2, (10, h - 60), (280, h - 10), (20, 20, 30), -1)
+        frame = cv2.addWeighted(overlay2, 0.7, frame, 0.3, 0)
+
+        for i, (label, is_up) in enumerate(zip(finger_labels, finger_states)):
+            x = debug_x + i * 52
+            color = (0, 255, 0) if is_up else (0, 0, 180)
+            cv2.circle(frame, (x + 10, debug_y), 8, color, -1, cv2.LINE_AA)
+            cv2.putText(frame, label, (x - 2, debug_y - 14),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, (180, 180, 200), 1)
 
         return frame
 

@@ -3,16 +3,23 @@ Drawing Engine Module
 ======================
 Manages the virtual canvas, drawing operations, color/brush controls,
 undo history, and canvas-to-frame overlay blending.
+
+Enhanced with:
+- Bézier curve interpolation for ultra-smooth lines
+- Point buffer for natural-looking strokes
+- Adaptive jump threshold based on brush size
+- Cursor position smoothing (separate from landmark smoothing)
 """
 
 import cv2
 import numpy as np
 import os
 from datetime import datetime
+from collections import deque
 
 
 class DrawingEngine:
-    """Virtual canvas with drawing, erasing, undo, and overlay capabilities."""
+    """Virtual canvas with smooth drawing, erasing, undo, and overlay capabilities."""
 
     # Predefined color palette (BGR format for OpenCV)
     COLORS = {
@@ -60,46 +67,123 @@ class DrawingEngine:
         self._undo_stack = []
         self._max_undo = 20
 
-        # Jump threshold: max distance between consecutive points before breaking the line
-        self._jump_threshold = 80
+        # --- Smoothing enhancements ---
+
+        # Cursor position smoothing (EMA on draw coordinates)
+        self._smooth_x = None
+        self._smooth_y = None
+        self._cursor_smoothing = 0.45  # Lower = smoother, higher = more responsive
+
+        # Point buffer for Bézier curve interpolation
+        self._point_buffer = deque(maxlen=4)
+
+        # Adaptive jump threshold (scales with brush size)
+        self._base_jump_threshold = 100
+
+        # Track if a stroke has been started (for undo grouping)
+        self._stroke_active = False
+
+    @property
+    def _jump_threshold(self):
+        """Adaptive jump threshold based on brush size."""
+        return self._base_jump_threshold + self.brush_size * 2
 
     def draw(self, x, y):
         """
-        Draw at the given position. Connects to previous point for smooth lines.
+        Draw at the given position with smoothing and interpolation.
 
         Args:
             x: X coordinate on canvas.
             y: Y coordinate on canvas.
         """
+        # Apply cursor position smoothing
+        if self._smooth_x is None:
+            self._smooth_x = float(x)
+            self._smooth_y = float(y)
+        else:
+            alpha = self._cursor_smoothing
+            self._smooth_x = alpha * x + (1 - alpha) * self._smooth_x
+            self._smooth_y = alpha * y + (1 - alpha) * self._smooth_y
+
+        sx, sy = int(self._smooth_x), int(self._smooth_y)
+
+        # Save undo state at stroke start
+        if not self._stroke_active:
+            self._save_undo_state()
+            self._stroke_active = True
+
         draw_color = (0, 0, 0) if self.eraser_mode else self.color
         thickness = self.brush_size * 3 if self.eraser_mode else self.brush_size
 
+        # Add to point buffer
+        self._point_buffer.append((sx, sy))
+
         if self._prev_point is not None:
-            # Calculate distance to prevent jumps
             dist = np.sqrt(
-                (x - self._prev_point[0]) ** 2 +
-                (y - self._prev_point[1]) ** 2
+                (sx - self._prev_point[0]) ** 2 +
+                (sy - self._prev_point[1]) ** 2
             )
 
             if dist < self._jump_threshold:
-                # Draw a line from previous to current point
-                cv2.line(
-                    self.canvas,
-                    self._prev_point, (x, y),
-                    draw_color, thickness,
-                    lineType=cv2.LINE_AA
-                )
+                if len(self._point_buffer) >= 3:
+                    # Use quadratic Bézier interpolation for smooth curves
+                    self._draw_smooth_line(draw_color, thickness)
+                else:
+                    # Not enough points yet; draw simple line
+                    cv2.line(
+                        self.canvas,
+                        self._prev_point, (sx, sy),
+                        draw_color, thickness,
+                        lineType=cv2.LINE_AA
+                    )
+            # If distance exceeds threshold, skip (prevents wild jumps)
 
-        # Draw a circle at the current point (round cap)
-        cv2.circle(self.canvas, (x, y), thickness // 2, draw_color, -1, lineType=cv2.LINE_AA)
+        # Draw circle at current point (round cap)
+        cv2.circle(self.canvas, (sx, sy), thickness // 2, draw_color, -1, lineType=cv2.LINE_AA)
 
-        self._prev_point = (x, y)
+        self._prev_point = (sx, sy)
+
+    def _draw_smooth_line(self, color, thickness):
+        """
+        Draw a smooth line using quadratic Bézier interpolation
+        through recent points in the buffer.
+        """
+        points = list(self._point_buffer)
+        n = len(points)
+
+        if n < 3:
+            # Fallback to simple line
+            if n == 2:
+                cv2.line(self.canvas, points[0], points[1], color, thickness, cv2.LINE_AA)
+            return
+
+        # Use last 3 points for quadratic Bézier
+        p0 = np.array(points[-3], dtype=np.float64)
+        p1 = np.array(points[-2], dtype=np.float64)
+        p2 = np.array(points[-1], dtype=np.float64)
+
+        # Generate interpolated points along the curve
+        num_steps = max(int(np.linalg.norm(p2 - p0) / 3), 4)
+
+        prev_pt = None
+        for i in range(num_steps + 1):
+            t = i / num_steps
+            # Quadratic Bézier: B(t) = (1-t)²·P0 + 2(1-t)t·P1 + t²·P2
+            pt = (1 - t) ** 2 * p0 + 2 * (1 - t) * t * p1 + t ** 2 * p2
+            pt_int = (int(pt[0]), int(pt[1]))
+
+            if prev_pt is not None:
+                cv2.line(self.canvas, prev_pt, pt_int, color, thickness, cv2.LINE_AA)
+
+            prev_pt = pt_int
 
     def stop_drawing(self):
-        """Stop the current stroke (reset previous point)."""
-        if self._prev_point is not None:
-            self._save_undo_state()
+        """Stop the current stroke (reset previous point and smoothing)."""
         self._prev_point = None
+        self._smooth_x = None
+        self._smooth_y = None
+        self._point_buffer.clear()
+        self._stroke_active = False
 
     def set_color(self, color_index):
         """
@@ -137,12 +221,20 @@ class DrawingEngine:
         self._save_undo_state()
         self.canvas = np.zeros((self.height, self.width, 3), dtype=np.uint8)
         self._prev_point = None
+        self._smooth_x = None
+        self._smooth_y = None
+        self._point_buffer.clear()
+        self._stroke_active = False
 
     def undo(self):
         """Undo the last drawing action."""
         if self._undo_stack:
             self.canvas = self._undo_stack.pop()
             self._prev_point = None
+            self._smooth_x = None
+            self._smooth_y = None
+            self._point_buffer.clear()
+            self._stroke_active = False
 
     def save_canvas(self, save_dir="sessions"):
         """
@@ -163,7 +255,7 @@ class DrawingEngine:
 
     def get_overlay(self, frame):
         """
-        Overlay the canvas onto the camera frame using additive blending.
+        Overlay the canvas onto the camera frame using masking.
 
         Args:
             frame: BGR camera frame (must match canvas dimensions).
