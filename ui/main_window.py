@@ -362,11 +362,16 @@ class MainWindow(QMainWindow):
 
         # --- Step 3: Process gesture actions ---
         if gesture == Gesture.DRAW:
-            # Check if draw is paused (index finger dropped — draw lock still active)
+            pos = self.hand_tracker.get_fingertip_position(1)  # Index finger
+
+            if pos:
+                # Update stillness tracking with current fingertip position
+                self.gesture_controller.update_draw_position(pos[0], pos[1])
+
+            # Check if draw is paused (stillness timeout OR finger dropped)
             if self.gesture_controller.draw_paused:
                 self.drawing_engine.stop_drawing()
             else:
-                pos = self.hand_tracker.get_fingertip_position(1)  # Index finger
                 if pos:
                     if pos[1] > self.HEADER_HEIGHT:
                         self.drawing_engine.set_eraser(False)
@@ -375,6 +380,13 @@ class MainWindow(QMainWindow):
                         self.drawing_engine.stop_drawing()
                 else:
                     self.drawing_engine.stop_drawing()
+
+            # Draw stillness progress ring around fingertip
+            if pos:
+                stillness = self.gesture_controller.get_stillness_progress()
+                if stillness > 0.05:
+                    self._draw_stillness_ring(frame, pos, stillness)
+
         elif gesture == Gesture.ERASE:
             pos = self.hand_tracker.get_fingertip_position(2)  # Middle finger
             if pos and pos[1] > self.HEADER_HEIGHT:
@@ -486,6 +498,52 @@ class MainWindow(QMainWindow):
                         cv2.FONT_HERSHEY_SIMPLEX, 0.35, (180, 180, 200), 1)
 
         return frame
+
+    def _draw_stillness_ring(self, frame, pos, progress):
+        """
+        Draw a visual ring around the fingertip showing stillness progress.
+        The arc fills clockwise from 0% to 100% over 1 second of stillness.
+        Color transitions: green → orange → red as the timer fills.
+
+        Args:
+            frame: The current frame to draw on.
+            pos: (x, y) fingertip position.
+            progress: Float 0.0–1.0 representing stillness progress.
+        """
+        x, y = int(pos[0]), int(pos[1])
+        radius = 25
+
+        # Color transition: green → orange → red
+        if progress < 0.5:
+            # Green to Orange
+            t = progress * 2
+            color = (0, int(255 * (1 - t * 0.5)), int(255 * t))  # BGR
+        else:
+            # Orange to Red
+            t = (progress - 0.5) * 2
+            color = (0, int(128 * (1 - t)), 255)  # BGR
+
+        # Draw background ring (dark)
+        cv2.circle(frame, (x, y), radius, (40, 40, 40), 2, cv2.LINE_AA)
+
+        # Draw progress arc
+        angle = int(progress * 360)
+        if angle > 0:
+            cv2.ellipse(
+                frame, (x, y), (radius, radius),
+                -90,  # Start from top
+                0, angle,
+                color, 3, cv2.LINE_AA
+            )
+
+        # Draw percentage text
+        pct_text = f"{int(progress * 100)}%"
+        text_size = cv2.getTextSize(pct_text, cv2.FONT_HERSHEY_SIMPLEX, 0.35, 1)[0]
+        cv2.putText(
+            frame, pct_text,
+            (x - text_size[0] // 2, y + radius + 15),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.35, color, 1, cv2.LINE_AA
+        )
 
     def _check_header_selection(self, x, y):
         """Check if the selection point hits a header UI element."""
@@ -617,11 +675,14 @@ class MainWindow(QMainWindow):
             "Gesture Guide",
             "<h3>✋ Gesture Controls</h3>"
             "<table>"
-            "<tr><td><b>☝️ Index Finger</b></td><td>Draw (locks on — very stable)</td></tr>"
+            "<tr><td><b>☝️ Index Finger</b></td><td>Draw — stop by holding still for 1s</td></tr>"
             "<tr><td><b>✌️ Index + Middle</b></td><td>Selection Mode</td></tr>"
             "<tr><td><b>🖐️ Open Palm (hold 1.5s)</b></td><td>Clear Canvas</td></tr>"
             "<tr><td><b>🖕 Middle Finger Only</b></td><td>Eraser</td></tr>"
             "</table>"
+            "<br><p><b>✏️ Drawing tip:</b> Keep moving to draw. "
+            "Hold your finger still for 1 second to end a stroke. "
+            "A ring indicator shows the pause countdown.</p>"
             "<br><p><b>💾 Save:</b> Use the Save button or <b>Ctrl+S</b></p>"
             "<br><p><i>Tip: Use Selection mode to pick colors from the header bar!</i></p>"
         )
