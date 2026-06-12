@@ -1,13 +1,17 @@
 """
-Gesture Controller Module — V5 (Stillness-Based Draw Release)
-===============================================================
-Drawing release is now based on finger stillness, not finger-down:
-- Drawing continues as long as the index finger keeps moving
-- When the finger stops moving (held still) for 1 second → drawing pauses
-- If the finger starts moving again → drawing resumes instantly
-- Finger-down still works as a fallback release
+Gesture Controller Module — V6 (Pen Up/Down State Machine)
+============================================================
+Drawing uses a symmetrical hold-to-toggle system:
 
-Other gestures unchanged from V4.
+  1. Show index finger → enters draw mode (pen UP initially)
+  2. Hold still 1 second → pen goes DOWN (starts drawing)
+  3. Move finger → draws on canvas
+  4. Hold still 1 second → pen goes UP (stops drawing)
+  5. Move to next letter position freely (no lines drawn)
+  6. Hold still 1 second → pen goes DOWN again
+  7. Repeat...
+
+Open palm gesture now overrides draw lock immediately.
 """
 
 import time
@@ -24,10 +28,17 @@ class Gesture:
     ERASE = "erase"
 
 
+class PenState:
+    """Sub-states within the DRAW gesture."""
+    UP = "up"           # Pen lifted — movement doesn't draw
+    DOWN = "down"       # Pen pressed — movement draws
+    TRANSITIONING = "transitioning"  # Holding still, about to switch
+
+
 class GestureController:
     """
     Translates finger states into application gestures with
-    stillness-based draw release and gesture inertia.
+    symmetrical pen up/down toggling via stillness.
     """
 
     HOLD_DURATION = 1.5       # Clear requires 1.5s hold
@@ -35,16 +46,15 @@ class GestureController:
 
     BUFFER_SIZE = 9
 
-    # How many consecutive frames of a DIFFERENT gesture to exit
+    # Frames needed to break out of a gesture via inertia
     DRAW_EXIT_FRAMES = 3
     ERASE_EXIT_FRAMES = 3
     DEFAULT_EXIT_FRAMES = 3
 
-    # --- Stillness-based draw release config ---
-    STILLNESS_TIMEOUT = 1.0       # Seconds of no movement to pause drawing
-    MOVEMENT_THRESHOLD = 8.0      # Pixels — movement below this = "still"
-    RESUME_THRESHOLD = 12.0       # Pixels — movement above this = "moving again"
-                                  # (higher than MOVEMENT_THRESHOLD for hysteresis)
+    # --- Stillness config ---
+    STILLNESS_TIMEOUT = 1.0       # Seconds to hold still to toggle pen state
+    MOVEMENT_THRESHOLD = 8.0      # Pixels — below this = "still"
+    RESUME_THRESHOLD = 12.0       # Pixels — above this = "moving" (hysteresis)
 
     def __init__(self):
         self.current_gesture = Gesture.NONE
@@ -70,12 +80,14 @@ class GestureController:
         # --- Draw lock ---
         self._draw_active = False
         self._index_down_count = 0
-        self.draw_paused = False
 
-        # --- Stillness tracking ---
-        self._last_draw_pos = None       # (x, y) of fingertip last frame
-        self._still_start_time = None    # When the finger first became still
-        self._is_still = False           # Currently in "still" state
+        # --- Pen state machine ---
+        self.pen_state = PenState.UP        # Current pen state
+        self.draw_paused = False             # True = don't draw this frame
+        self._last_draw_pos = None           # Last fingertip (x, y)
+        self._still_start_time = None        # When finger became still
+        self._is_still = False               # Currently in "still" state
+        self._pen_just_toggled = False       # Prevents immediate re-toggle
 
     def recognize(self, finger_states):
         """
@@ -84,11 +96,10 @@ class GestureController:
         if not finger_states or len(finger_states) != 5:
             self._gesture_buffer.append(Gesture.NONE)
             self.clear_triggered = False
-            self.draw_paused = False
+            self.draw_paused = True  # No hand = no drawing
             return self._apply_inertia(Gesture.NONE)
 
         self.clear_triggered = False
-        self.draw_paused = False
 
         # Classify raw gesture
         raw = self._classify(finger_states)
@@ -96,27 +107,34 @@ class GestureController:
 
         # --- Draw lock logic ---
         _, index, _, _, _ = finger_states
+
         if self._draw_active:
-            if not index:
+            # === OPEN PALM OVERRIDE ===
+            # If raw classification clearly shows open palm, break draw lock
+            # immediately — this is a deliberate gesture
+            if raw == Gesture.CLEAR:
+                self._draw_active = False
+                self._index_down_count = 0
+                self._reset_pen_state()
+                # Fall through to normal gesture processing below
+            elif not index:
                 self._index_down_count += 1
                 self.draw_paused = True
             else:
                 self._index_down_count = 0
 
-            # Check stillness-based pause (only when index is up)
-            if index and self._is_still and self._still_start_time is not None:
-                still_duration = time.time() - self._still_start_time
-                if still_duration >= self.STILLNESS_TIMEOUT:
-                    self.draw_paused = True
-
-            # Exit draw lock: finger down for enough frames
-            if self._index_down_count < self.DRAW_EXIT_FRAMES:
-                self.current_gesture = Gesture.DRAW
-                return Gesture.DRAW
-            else:
+            # Exit draw lock if index has been down long enough
+            if self._draw_active and self._index_down_count >= self.DRAW_EXIT_FRAMES:
                 self._draw_active = False
                 self._index_down_count = 0
-                self._reset_stillness()
+                self._reset_pen_state()
+
+            # If still in draw lock, enforce DRAW gesture
+            if self._draw_active:
+                # Set draw_paused based on pen state
+                self.draw_paused = (self.pen_state != PenState.DOWN)
+                self.current_gesture = Gesture.DRAW
+                return Gesture.DRAW
 
         # Get buffer consensus
         consensus = self._get_consensus()
@@ -128,7 +146,12 @@ class GestureController:
         if result == Gesture.DRAW and self.previous_gesture != Gesture.DRAW:
             self._draw_active = True
             self._index_down_count = 0
-            self._reset_stillness()
+            self._reset_pen_state()
+            self.draw_paused = True  # Start with pen UP — need to hold still first
+
+        # If not drawing, always pause
+        if result != Gesture.DRAW:
+            self.draw_paused = True
 
         # Handle CLEAR hold
         self._handle_hold(result)
@@ -139,12 +162,8 @@ class GestureController:
 
     def update_draw_position(self, x, y):
         """
-        Call this every frame when drawing is active with the current
-        fingertip position. Updates stillness tracking.
-
-        Args:
-            x: Current fingertip X position.
-            y: Current fingertip Y position.
+        Call every frame during draw mode with the fingertip position.
+        Manages the pen up/down state machine based on stillness.
         """
         if not self._draw_active:
             return
@@ -152,58 +171,75 @@ class GestureController:
         now = time.time()
 
         if self._last_draw_pos is None:
-            # First frame of drawing — initialize
             self._last_draw_pos = (x, y)
             self._still_start_time = now
-            self._is_still = False
+            self._is_still = True  # Start as still — user needs to hold to begin
+            self._pen_just_toggled = False
             return
 
-        # Calculate movement distance from last frame
+        # Calculate movement
         dx = x - self._last_draw_pos[0]
         dy = y - self._last_draw_pos[1]
         distance = math.sqrt(dx * dx + dy * dy)
+        self._last_draw_pos = (x, y)
 
+        # --- Stillness state machine ---
         if self._is_still:
-            # Currently still — check if movement resumed
             if distance > self.RESUME_THRESHOLD:
-                # Finger started moving again → resume drawing
+                # Finger started moving
                 self._is_still = False
                 self._still_start_time = None
-                self.draw_paused = False
-            # If still below threshold, stay still (timer continues)
-        else:
-            # Currently moving — check if finger became still
-            if distance < self.MOVEMENT_THRESHOLD:
-                if self._still_start_time is None:
-                    # Just became still — start the timer
-                    self._still_start_time = now
-                self._is_still = True
+                self._pen_just_toggled = False
             else:
-                # Still moving — reset
-                self._still_start_time = None
+                # Still holding still — check timeout
+                if self._still_start_time is not None and not self._pen_just_toggled:
+                    elapsed = now - self._still_start_time
+                    if elapsed >= self.STILLNESS_TIMEOUT:
+                        # Toggle pen state!
+                        self._toggle_pen()
+                        self._pen_just_toggled = True
+        else:
+            # Currently moving
+            if distance < self.MOVEMENT_THRESHOLD:
+                # Finger became still
+                self._is_still = True
+                self._still_start_time = now
+                self._pen_just_toggled = False
+            # else: still moving, nothing to do
 
-        self._last_draw_pos = (x, y)
+        # Update draw_paused based on pen state
+        self.draw_paused = (self.pen_state != PenState.DOWN)
+
+    def _toggle_pen(self):
+        """Toggle between pen UP and DOWN."""
+        if self.pen_state == PenState.UP:
+            self.pen_state = PenState.DOWN  # Start drawing
+        else:
+            self.pen_state = PenState.UP    # Stop drawing
+
+    def _reset_pen_state(self):
+        """Reset all pen/stillness state."""
+        self.pen_state = PenState.UP
+        self.draw_paused = True
+        self._last_draw_pos = None
+        self._still_start_time = None
+        self._is_still = False
+        self._pen_just_toggled = False
 
     def get_stillness_progress(self):
         """
-        Get the progress toward stillness timeout (0.0 to 1.0).
-        Used to show a visual indicator to the user.
+        Get the progress toward next pen toggle (0.0 to 1.0).
+        Returns 0 if not currently still or already toggled.
         """
-        if not self._is_still or self._still_start_time is None:
+        if not self._is_still or self._still_start_time is None or self._pen_just_toggled:
             return 0.0
         elapsed = time.time() - self._still_start_time
         return min(elapsed / self.STILLNESS_TIMEOUT, 1.0)
 
-    def _reset_stillness(self):
-        """Reset all stillness tracking state."""
-        self._last_draw_pos = None
-        self._still_start_time = None
-        self._is_still = False
-
     def _classify(self, states):
         """
         Classify gesture from finger states.
-        Thumb is FULLY IGNORED (most unreliable finger).
+        Thumb is FULLY IGNORED.
         """
         _, index, middle, ring, pinky = states
         non_thumb_up = sum([index, middle, ring, pinky])
@@ -216,19 +252,18 @@ class GestureController:
         if index and not middle:
             return Gesture.DRAW
 
-        # PEACE / V-SIGN: Index + Middle up, no ring/pinky → Select
+        # PEACE: Index + Middle, no ring/pinky → Select
         if index and middle and not ring and not pinky:
             return Gesture.SELECT
 
-        # MIDDLE ONLY: Just middle up → Erase
+        # MIDDLE ONLY → Erase
         if middle and not index and not ring and not pinky:
             return Gesture.ERASE
 
-        # No fingers or unrecognized → NONE
         return Gesture.NONE
 
     def _get_consensus(self):
-        """Get the consensus gesture from the buffer using weighted voting."""
+        """Get consensus gesture from buffer with weighted voting."""
         if not self._gesture_buffer:
             return Gesture.NONE
 
@@ -246,8 +281,7 @@ class GestureController:
         if self.current_gesture in scores:
             scores[self.current_gesture] += 2
 
-        winner = max(scores, key=scores.get)
-        return winner
+        return max(scores, key=scores.get)
 
     def _apply_inertia(self, new_gesture):
         """Resist switching away from current gesture."""
@@ -297,7 +331,7 @@ class GestureController:
                 self._held_gesture = Gesture.NONE
 
     def get_hold_progress(self):
-        """Get the progress of the current hold gesture (0.0 to 1.0)."""
+        """Get the progress of the CLEAR hold gesture (0.0 to 1.0)."""
         if self._held_gesture == Gesture.CLEAR:
             elapsed = time.time() - self._hold_start_time
             return min(elapsed / self.HOLD_DURATION, 1.0)
@@ -305,21 +339,20 @@ class GestureController:
 
     def get_gesture_display_name(self):
         """Get a human-readable name for the current gesture."""
+        if self.current_gesture == Gesture.DRAW:
+            progress = self.get_stillness_progress()
+            if progress > 0.1:
+                action = "Pen Down" if self.pen_state == PenState.UP else "Pen Up"
+                return f"✏️ Hold → {action} {int(progress * 100)}%"
+            elif self.pen_state == PenState.DOWN:
+                return "✏️ Drawing (Pen Down)"
+            else:
+                return "✏️ Pen Up — hold still to draw"
+
         names = {
             Gesture.NONE: "No Gesture",
-            Gesture.DRAW: "✏️ Drawing",
             Gesture.SELECT: "👆 Selection",
             Gesture.CLEAR: "🖐️ Hold to Clear",
             Gesture.ERASE: "🧹 Eraser",
         }
-        gesture_name = names.get(self.current_gesture, "Unknown")
-
-        # Show stillness status when drawing
-        if self.current_gesture == Gesture.DRAW:
-            progress = self.get_stillness_progress()
-            if progress > 0.1:
-                gesture_name = f"✏️ Pausing... {int(progress * 100)}%"
-            elif self.draw_paused:
-                gesture_name = "✏️ Paused"
-
-        return gesture_name
+        return names.get(self.current_gesture, "Unknown")

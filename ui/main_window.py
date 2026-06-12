@@ -502,26 +502,35 @@ class MainWindow(QMainWindow):
     def _draw_stillness_ring(self, frame, pos, progress):
         """
         Draw a visual ring around the fingertip showing stillness progress.
-        The arc fills clockwise from 0% to 100% over 1 second of stillness.
-        Color transitions: green → orange → red as the timer fills.
+        Color depends on what the hold will DO:
+        - Green ring = about to START drawing (pen is currently UP)
+        - Red ring = about to STOP drawing (pen is currently DOWN)
 
         Args:
             frame: The current frame to draw on.
             pos: (x, y) fingertip position.
             progress: Float 0.0–1.0 representing stillness progress.
         """
-        x, y = int(pos[0]), int(pos[1])
-        radius = 25
+        from modules.gesture_controller import PenState
 
-        # Color transition: green → orange → red
-        if progress < 0.5:
-            # Green to Orange
-            t = progress * 2
-            color = (0, int(255 * (1 - t * 0.5)), int(255 * t))  # BGR
+        x, y = int(pos[0]), int(pos[1])
+        radius = 28
+
+        # Color based on pen state (what will happen when hold completes)
+        pen_is_down = self.gesture_controller.pen_state == PenState.DOWN
+
+        if pen_is_down:
+            # Currently drawing → hold will STOP → red theme
+            color = (0, 0, 255)       # Red (BGR)
+            label = "Stop"
         else:
-            # Orange to Red
-            t = (progress - 0.5) * 2
-            color = (0, int(128 * (1 - t)), 255)  # BGR
+            # Currently not drawing → hold will START → green theme
+            color = (0, 220, 0)       # Green (BGR)
+            label = "Start"
+
+        # Fade color intensity with progress
+        intensity = 0.4 + 0.6 * progress
+        draw_color = tuple(int(c * intensity) for c in color)
 
         # Draw background ring (dark)
         cv2.circle(frame, (x, y), radius, (40, 40, 40), 2, cv2.LINE_AA)
@@ -531,18 +540,17 @@ class MainWindow(QMainWindow):
         if angle > 0:
             cv2.ellipse(
                 frame, (x, y), (radius, radius),
-                -90,  # Start from top
-                0, angle,
-                color, 3, cv2.LINE_AA
+                -90, 0, angle,
+                draw_color, 3, cv2.LINE_AA
             )
 
-        # Draw percentage text
-        pct_text = f"{int(progress * 100)}%"
-        text_size = cv2.getTextSize(pct_text, cv2.FONT_HERSHEY_SIMPLEX, 0.35, 1)[0]
+        # Draw action label and percentage
+        pct_text = f"{label} {int(progress * 100)}%"
+        text_size = cv2.getTextSize(pct_text, cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1)[0]
         cv2.putText(
             frame, pct_text,
-            (x - text_size[0] // 2, y + radius + 15),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.35, color, 1, cv2.LINE_AA
+            (x - text_size[0] // 2, y + radius + 18),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.4, draw_color, 1, cv2.LINE_AA
         )
 
     def _check_header_selection(self, x, y):
@@ -675,14 +683,20 @@ class MainWindow(QMainWindow):
             "Gesture Guide",
             "<h3>✋ Gesture Controls</h3>"
             "<table>"
-            "<tr><td><b>☝️ Index Finger</b></td><td>Draw — stop by holding still for 1s</td></tr>"
+            "<tr><td><b>☝️ Index Finger</b></td><td>Draw Mode</td></tr>"
             "<tr><td><b>✌️ Index + Middle</b></td><td>Selection Mode</td></tr>"
             "<tr><td><b>🖐️ Open Palm (hold 1.5s)</b></td><td>Clear Canvas</td></tr>"
             "<tr><td><b>🖕 Middle Finger Only</b></td><td>Eraser</td></tr>"
             "</table>"
-            "<br><p><b>✏️ Drawing tip:</b> Keep moving to draw. "
-            "Hold your finger still for 1 second to end a stroke. "
-            "A ring indicator shows the pause countdown.</p>"
+            "<br><h4>✏️ How Drawing Works</h4>"
+            "<ol>"
+            "<li>Raise index finger → enters Draw Mode (pen UP)</li>"
+            "<li><b>Hold still 1s</b> → 🟢 green ring fills → pen goes <b>DOWN</b></li>"
+            "<li>Move finger → draws on canvas</li>"
+            "<li><b>Hold still 1s</b> → 🔴 red ring fills → pen goes <b>UP</b></li>"
+            "<li>Move to next letter position (no lines drawn)</li>"
+            "<li>Hold still 1s again → pen DOWN, start next letter</li>"
+            "</ol>"
             "<br><p><b>💾 Save:</b> Use the Save button or <b>Ctrl+S</b></p>"
             "<br><p><i>Tip: Use Selection mode to pick colors from the header bar!</i></p>"
         )
