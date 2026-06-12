@@ -278,16 +278,14 @@ class HandTracker:
 
     def get_finger_states(self):
         """
-        Determine which fingers are up using multiple geometric checks
-        with running confidence scores for stability.
+        Determine which fingers are up using a primary check with
+        confirmation checks.
 
-        Uses three independent checks per finger:
-        1. Tip vs PIP joint Y position
-        2. Tip vs MCP joint Y position
-        3. Finger curl angle
-
-        A finger is "up" if at least 2 of 3 checks agree.
-        Confidence-based hysteresis prevents flickering.
+        Logic:
+        - Check 1 (tip Y above PIP Y) is REQUIRED for a finger to be "up"
+        - Checks 2 and 3 provide confidence weighting
+        - Ring and pinky have stricter thresholds (harder to go up)
+          to prevent false-positive that triggers CLEAR
         """
         if len(self.landmarks) < 21:
             return [False] * 5
@@ -301,26 +299,21 @@ class HandTracker:
         wrist = np.array(self.landmarks[0][1:3])
         index_mcp = np.array(self.landmarks[5][1:3])
 
-        # Check 1: Tip distance from wrist vs MCP distance from wrist
         tip_dist = np.linalg.norm(thumb_tip - wrist)
         mcp_dist = np.linalg.norm(thumb_mcp - wrist)
         check1 = tip_dist > mcp_dist * 1.2
 
-        # Check 2: Tip distance from index MCP (extended thumb is far from palm)
         tip_to_index = np.linalg.norm(thumb_tip - index_mcp)
         mcp_to_index = np.linalg.norm(thumb_mcp - index_mcp)
         check2 = tip_to_index > mcp_to_index * 0.9
 
-        # Check 3: Angle-based (thumb extension angle)
         v1 = thumb_mcp - wrist
         v2 = thumb_tip - thumb_mcp
         angle = self._angle_between(v1, v2)
-        check3 = angle < 160  # Extended thumb has smaller angle
+        check3 = angle < 160
 
         thumb_votes = sum([check1, check2, check3])
         thumb_up = thumb_votes >= 2
-
-        # Apply confidence-based hysteresis
         thumb_up = self._apply_confidence(0, thumb_up, thumb_votes / 3.0)
         new_states.append(thumb_up)
 
@@ -334,23 +327,39 @@ class HandTracker:
             mcp = np.array(self.landmarks[mcp_id][1:3])
             wrist_pt = np.array(self.landmarks[0][1:3])
 
-            # Check 1: Tip Y above PIP Y (basic check)
-            check1 = tip[1] < pip[1]
+            # PRIMARY CHECK (required): Tip Y must be above PIP Y
+            # For ring (i=3) and pinky (i=4), require a larger margin
+            if i >= 3:
+                # Ring/Pinky: tip must be clearly above PIP (by at least 15px)
+                primary_up = tip[1] < (pip[1] - 15)
+            else:
+                # Index/Middle: standard check
+                primary_up = tip[1] < pip[1]
 
-            # Check 2: Tip Y above MCP Y (stronger check)
-            check2 = tip[1] < mcp[1]
+            if not primary_up:
+                # Primary check failed → finger is DOWN, no matter what
+                finger_up = False
+                vote_conf = 0.0
+            else:
+                # Primary check passed, use secondary checks for confidence
+                # Check 2: Tip Y above MCP Y
+                check2 = tip[1] < mcp[1]
 
-            # Check 3: Tip distance from wrist > PIP distance from wrist
-            # (extended finger reaches further from wrist)
-            tip_wrist_dist = np.linalg.norm(tip - wrist_pt)
-            pip_wrist_dist = np.linalg.norm(pip - wrist_pt)
-            check3 = tip_wrist_dist > pip_wrist_dist * 0.95
+                # Check 3: Tip further from wrist than PIP (stricter)
+                tip_wrist_dist = np.linalg.norm(tip - wrist_pt)
+                pip_wrist_dist = np.linalg.norm(pip - wrist_pt)
+                # Ring/Pinky need a much larger margin
+                if i >= 3:
+                    check3 = tip_wrist_dist > pip_wrist_dist * 1.15
+                else:
+                    check3 = tip_wrist_dist > pip_wrist_dist * 1.0
 
-            votes = sum([check1, check2, check3])
-            finger_up = votes >= 2
+                confirmation_votes = sum([check2, check3])
+                # With primary + confirmations: total score
+                vote_conf = (1.0 + confirmation_votes) / 3.0
+                finger_up = True  # Primary passed
 
-            # Apply confidence-based hysteresis
-            finger_up = self._apply_confidence(i, finger_up, votes / 3.0)
+            finger_up = self._apply_confidence(i, finger_up, vote_conf)
             new_states.append(finger_up)
 
         self._finger_states = new_states
@@ -360,28 +369,54 @@ class HandTracker:
         """
         Apply confidence-based hysteresis to prevent flickering.
 
-        The confidence accumulates over frames. A finger only changes
-        state when confidence crosses a threshold.
+        Index finger (idx=1): rises fast, falls at moderate speed
+        (no longer ultra-sticky — allows prompt draw stop).
+
+        Ring/Pinky (idx=3,4): rises slowly, falls fast
+        (prevents false open-palm detection).
         """
         current_up = self._finger_states[finger_idx]
         conf = self._finger_confidence[finger_idx]
 
+        is_index = (finger_idx == 1)
+        is_ring_pinky = (finger_idx >= 3)
+
         if raw_up:
-            # Increase confidence toward "up" (positive)
-            conf = min(conf + vote_confidence * 0.4, 1.0)
+            if is_index:
+                rise_rate = 0.5       # Index rises fast
+            elif is_ring_pinky:
+                rise_rate = 0.25      # Ring/Pinky rise slowly (prevent false up)
+            else:
+                rise_rate = 0.4
+            conf = min(conf + vote_confidence * rise_rate, 1.0)
         else:
-            # Decrease confidence toward "down" (negative mapped to 0)
-            conf = max(conf - vote_confidence * 0.4, 0.0)
+            if is_index:
+                fall_rate = 0.35      # Index falls at moderate speed (was 0.15)
+            elif is_ring_pinky:
+                fall_rate = 0.5       # Ring/Pinky fall fast (eager to go down)
+            else:
+                fall_rate = 0.4
+            conf = max(conf - max(vote_confidence, 0.3) * fall_rate, 0.0)
 
         self._finger_confidence[finger_idx] = conf
 
         # Hysteresis thresholds
         if current_up:
-            # Currently up: only go down if confidence drops below 0.3
-            return conf >= 0.3
+            if is_ring_pinky:
+                down_threshold = 0.4   # Ring/Pinky drop easily
+            elif is_index:
+                down_threshold = 0.25  # Index still somewhat sticky
+            else:
+                down_threshold = 0.3
+            return conf >= down_threshold
         else:
-            # Currently down: only go up if confidence rises above 0.6
-            return conf >= 0.6
+            if is_ring_pinky:
+                up_threshold = 0.75    # Ring/Pinky very hard to go up
+            elif is_index:
+                up_threshold = 0.5     # Index goes up readily
+            else:
+                up_threshold = 0.6
+            return conf >= up_threshold
 
     @staticmethod
     def _angle_between(v1, v2):

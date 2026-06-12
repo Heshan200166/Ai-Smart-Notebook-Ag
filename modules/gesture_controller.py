@@ -1,13 +1,15 @@
 """
-Gesture Controller Module — V3 (Rewritten for Accuracy)
-========================================================
-Simpler, more forgiving gesture classification with larger stabilization
-buffer and weighted voting.
+Gesture Controller Module — V4 (Stability-First Rewrite)
+==========================================================
+Focused on eliminating false triggers and maintaining gesture continuity.
 
-Key changes:
-- Larger buffer (7 frames) with weighted recency voting
-- Simpler gesture rules with wider tolerance
-- Separate "confirmed" gesture that only changes after strong consensus
+Key changes from V3:
+- SAVE gesture REMOVED (too unreliable — use button/Ctrl+S only)
+- Draw-mode locking: once drawing starts, stays in draw until index
+  finger clearly drops for multiple frames
+- Gesture inertia: current gesture gets bonus weight, resists switching
+- Simpler classification with wider tolerance
+- CLEAR requires very sustained open palm
 """
 
 import time
@@ -20,21 +22,25 @@ class Gesture:
     DRAW = "draw"
     SELECT = "select"
     CLEAR = "clear"
-    SAVE = "save"
     ERASE = "erase"
 
 
 class GestureController:
     """
-    Translates finger states into application gestures with strong
-    stabilization and forgiving classification.
+    Translates finger states into application gestures with
+    draw-mode locking and strong inertia to prevent interruptions.
     """
 
-    HOLD_DURATION = 0.8
-    COOLDOWN_DURATION = 2.0
+    HOLD_DURATION = 1.5       # Clear requires 1.5s hold (longer = safer)
+    COOLDOWN_DURATION = 2.5
 
-    # Larger buffer for stability
-    BUFFER_SIZE = 7
+    BUFFER_SIZE = 9           # Larger buffer for more stability
+
+    # How many consecutive frames of a DIFFERENT gesture are needed
+    # to break out of the current gesture
+    DRAW_EXIT_FRAMES = 3      # Reduced from 5 — allows prompt release
+    ERASE_EXIT_FRAMES = 3
+    DEFAULT_EXIT_FRAMES = 3
 
     def __init__(self):
         self.current_gesture = Gesture.NONE
@@ -49,25 +55,25 @@ class GestureController:
 
         # Triggered flags
         self.clear_triggered = False
-        self.save_triggered = False
+        # save_triggered REMOVED — save only via button/Ctrl+S
 
-        # --- Stabilization buffer with timestamps ---
+        # --- Stabilization ---
         self._gesture_buffer = deque(maxlen=self.BUFFER_SIZE)
 
-        # --- Transition rules ---
-        # How many buffer votes needed to switch TO a given gesture
-        self._switch_threshold = {
-            Gesture.DRAW: 2,      # Quick response for drawing
-            Gesture.SELECT: 3,    # Moderate response
-            Gesture.ERASE: 3,     # Moderate response
-            Gesture.CLEAR: 4,     # Higher threshold (destructive)
-            Gesture.SAVE: 4,      # Higher threshold (destructive)
-            Gesture.NONE: 3,      # Moderate to stop
-        }
+        # --- Inertia tracking ---
+        self._different_count = 0
+        self._candidate_gesture = Gesture.NONE
+
+        # --- Draw lock ---
+        self._draw_active = False   # True when user is actively drawing
+        self._index_down_count = 0  # Consecutive frames with index down
+        self.draw_paused = False     # True when index is down during draw lock
+                                     # Main window should stop drawing but not switch gesture
 
     def recognize(self, finger_states):
         """
-        Recognize gesture from finger states with weighted stabilization.
+        Recognize gesture from finger states with draw-mode locking
+        and inertia-based stabilization.
 
         Args:
             finger_states: List of 5 booleans [thumb, index, middle, ring, pinky].
@@ -77,130 +83,169 @@ class GestureController:
         """
         if not finger_states or len(finger_states) != 5:
             self._gesture_buffer.append(Gesture.NONE)
-            return self._update_gesture()
+            self.clear_triggered = False
+            self.draw_paused = False
+            return self._apply_inertia(Gesture.NONE)
 
-        # Reset triggered flags
         self.clear_triggered = False
-        self.save_triggered = False
+        self.draw_paused = False
 
         # Classify raw gesture
         raw = self._classify(finger_states)
         self._gesture_buffer.append(raw)
 
-        # Get stabilized gesture
-        return self._update_gesture()
+        # --- Draw lock logic ---
+        _, index, _, _, _ = finger_states
+        if self._draw_active:
+            if not index:
+                self._index_down_count += 1
+                # IMMEDIATELY pause drawing (don't draw with a down finger)
+                self.draw_paused = True
+            else:
+                self._index_down_count = 0
+
+            # Only exit draw lock if index has been down for enough frames
+            if self._index_down_count < self.DRAW_EXIT_FRAMES:
+                # Stay in draw mode regardless of other classification
+                self.current_gesture = Gesture.DRAW
+                return Gesture.DRAW
+            else:
+                # Index finger clearly dropped — release draw lock
+                self._draw_active = False
+                self._index_down_count = 0
+
+        # Get buffer consensus
+        consensus = self._get_consensus()
+
+        # Apply inertia
+        result = self._apply_inertia(consensus)
+
+        # Activate draw lock when entering draw mode
+        if result == Gesture.DRAW and self.previous_gesture != Gesture.DRAW:
+            self._draw_active = True
+            self._index_down_count = 0
+
+        # Handle CLEAR hold
+        self._handle_hold(result)
+
+        self.previous_gesture = self.current_gesture
+        self.current_gesture = result
+        return result
 
     def _classify(self, states):
         """
         Classify gesture from finger states.
-        Rules are ordered by specificity (most specific first).
-
-        The thumb is FULLY IGNORED for all gestures because it is
-        the most unreliably detected finger across all hand poses.
+        Thumb is FULLY IGNORED (most unreliable finger).
+        Rules are simple and non-overlapping.
         """
         _, index, middle, ring, pinky = states
-
-        # Count non-thumb fingers up
         non_thumb_up = sum([index, middle, ring, pinky])
 
-        # === FIST: No non-thumb fingers up → Save ===
-        if non_thumb_up == 0:
-            return Gesture.SAVE
-
-        # === OPEN PALM: All 4 non-thumb fingers up → Clear ===
-        if non_thumb_up == 4:
+        # === OPEN PALM: 3 or 4 non-thumb fingers up → Clear ===
+        # (3 fingers also counts — sometimes ring/pinky detection is unreliable)
+        if non_thumb_up >= 3 and index and middle:
             return Gesture.CLEAR
 
-        # === INDEX ONLY: Just index up → Draw ===
-        if index and non_thumb_up == 1:
+        # === INDEX ONLY: Just index up (maybe ring/pinky leaking) → Draw ===
+        if index and not middle:
             return Gesture.DRAW
 
-        # === PEACE / V-SIGN: Index + Middle up → Select ===
-        if index and middle and non_thumb_up == 2:
+        # === PEACE / V-SIGN: Index + Middle up, no ring/pinky → Select ===
+        if index and middle and not ring and not pinky:
             return Gesture.SELECT
 
         # === MIDDLE ONLY: Just middle up → Erase ===
-        if middle and non_thumb_up == 1:
+        if middle and not index and not ring and not pinky:
             return Gesture.ERASE
 
-        # === 3 fingers up (index+middle+ring) → still treat as Select ===
-        if index and middle and ring and not pinky:
-            return Gesture.SELECT
-
-        # === Index + any 1 other (not middle) → still Draw ===
-        if index and non_thumb_up == 2 and not middle:
-            return Gesture.DRAW
+        # === NO FINGERS UP → NONE (NOT save!) ===
+        if non_thumb_up == 0:
+            return Gesture.NONE
 
         return Gesture.NONE
 
-    def _update_gesture(self):
-        """
-        Determine the stable gesture using weighted recency voting.
-        Recent frames have more weight than older ones.
-        """
+    def _get_consensus(self):
+        """Get the consensus gesture from the buffer using weighted voting."""
         if not self._gesture_buffer:
-            self.current_gesture = Gesture.NONE
+            return Gesture.NONE
+
+        buf = list(self._gesture_buffer)
+        buf_len = len(buf)
+
+        # Weight recent frames much more heavily
+        # e.g. for 9 frames: [1, 1, 1, 2, 2, 2, 3, 3, 4]
+        weights = []
+        for i in range(buf_len):
+            weights.append(1 + (i * 4) // buf_len)
+
+        # Count weighted votes
+        scores = {}
+        for w, g in zip(weights, buf):
+            scores[g] = scores.get(g, 0) + w
+
+        # Give bonus weight to current gesture (inertia)
+        if self.current_gesture in scores:
+            scores[self.current_gesture] += 2
+
+        winner = max(scores, key=scores.get)
+        return winner
+
+    def _apply_inertia(self, new_gesture):
+        """
+        Apply inertia: resist switching away from current gesture
+        unless the new gesture is consistently different for enough frames.
+        """
+        if new_gesture == self.current_gesture:
+            self._different_count = 0
+            self._candidate_gesture = Gesture.NONE
             return self.current_gesture
 
+        # New gesture differs from current
+        if new_gesture == self._candidate_gesture:
+            self._different_count += 1
+        else:
+            self._candidate_gesture = new_gesture
+            self._different_count = 1
+
+        # Determine how many frames needed to switch
+        if self.current_gesture == Gesture.DRAW:
+            exit_frames = self.DRAW_EXIT_FRAMES
+        elif self.current_gesture == Gesture.ERASE:
+            exit_frames = self.ERASE_EXIT_FRAMES
+        else:
+            exit_frames = self.DEFAULT_EXIT_FRAMES
+
+        if self._different_count >= exit_frames:
+            self._different_count = 0
+            self._candidate_gesture = Gesture.NONE
+            return new_gesture
+
+        # Not enough evidence to switch — keep current
+        return self.current_gesture
+
+    def _handle_hold(self, gesture):
+        """Handle hold-to-activate for CLEAR gesture."""
         now = time.time()
         in_cooldown = (now - self._last_trigger_time) < self.COOLDOWN_DURATION
 
-        # Weighted vote: more recent = higher weight
-        # Weights: [1, 1, 2, 2, 3, 3, 4] for buffer of 7
-        weights = []
-        buf_len = len(self._gesture_buffer)
-        for i in range(buf_len):
-            weights.append(1 + i * 3 // buf_len)
-
-        # Count weighted votes
-        vote_scores = {}
-        for weight, gesture in zip(weights, self._gesture_buffer):
-            vote_scores[gesture] = vote_scores.get(gesture, 0) + weight
-
-        # Find winner
-        winner = max(vote_scores, key=vote_scores.get)
-        winner_score = vote_scores[winner]
-        total_weight = sum(weights)
-
-        # Calculate vote ratio
-        vote_ratio = winner_score / total_weight
-
-        # Determine threshold
-        threshold = self._switch_threshold.get(winner, 3)
-        raw_count = sum(1 for g in self._gesture_buffer if g == winner)
-
-        # Accept if raw count meets threshold OR weighted ratio is high
-        if raw_count >= threshold or vote_ratio > 0.6:
-            new_gesture = winner
+        if gesture == Gesture.CLEAR and not in_cooldown:
+            if self._held_gesture == Gesture.CLEAR:
+                hold_time = now - self._hold_start_time
+                if hold_time >= self.HOLD_DURATION:
+                    self.clear_triggered = True
+                    self._last_trigger_time = now
+                    self._held_gesture = Gesture.NONE
+                    self._gesture_buffer.clear()
+            else:
+                self._held_gesture = Gesture.CLEAR
+                self._hold_start_time = now
         else:
-            new_gesture = self.current_gesture  # Keep current
-
-        # --- Handle hold gestures ---
-        if new_gesture in (Gesture.CLEAR, Gesture.SAVE):
-            if not in_cooldown:
-                if self._held_gesture == new_gesture:
-                    hold_time = now - self._hold_start_time
-                    if hold_time >= self.HOLD_DURATION:
-                        if new_gesture == Gesture.CLEAR:
-                            self.clear_triggered = True
-                        elif new_gesture == Gesture.SAVE:
-                            self.save_triggered = True
-                        self._last_trigger_time = now
-                        self._held_gesture = Gesture.NONE
-                        self._gesture_buffer.clear()
-                else:
-                    self._held_gesture = new_gesture
-                    self._hold_start_time = now
-        else:
-            self._held_gesture = Gesture.NONE
-
-        self.previous_gesture = self.current_gesture
-        self.current_gesture = new_gesture
-        return self.current_gesture
+            if gesture != Gesture.CLEAR:
+                self._held_gesture = Gesture.NONE
 
     def get_hold_progress(self):
         """Get the progress of the current hold gesture (0.0 to 1.0)."""
-        if self._held_gesture in (Gesture.CLEAR, Gesture.SAVE):
+        if self._held_gesture == Gesture.CLEAR:
             elapsed = time.time() - self._hold_start_time
             return min(elapsed / self.HOLD_DURATION, 1.0)
         return 0.0
@@ -212,7 +257,6 @@ class GestureController:
             Gesture.DRAW: "✏️ Drawing",
             Gesture.SELECT: "👆 Selection",
             Gesture.CLEAR: "🖐️ Hold to Clear",
-            Gesture.SAVE: "✊ Hold to Save",
             Gesture.ERASE: "🧹 Eraser",
         }
         return names.get(self.current_gesture, "Unknown")

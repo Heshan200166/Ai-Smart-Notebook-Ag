@@ -362,12 +362,17 @@ class MainWindow(QMainWindow):
 
         # --- Step 3: Process gesture actions ---
         if gesture == Gesture.DRAW:
-            pos = self.hand_tracker.get_fingertip_position(1)  # Index finger
-            if pos:
-                # Check if finger is in the header UI area
-                if pos[1] > self.HEADER_HEIGHT:
-                    self.drawing_engine.set_eraser(False)
-                    self.drawing_engine.draw(pos[0], pos[1])
+            # Check if draw is paused (index finger dropped — draw lock still active)
+            if self.gesture_controller.draw_paused:
+                self.drawing_engine.stop_drawing()
+            else:
+                pos = self.hand_tracker.get_fingertip_position(1)  # Index finger
+                if pos:
+                    if pos[1] > self.HEADER_HEIGHT:
+                        self.drawing_engine.set_eraser(False)
+                        self.drawing_engine.draw(pos[0], pos[1])
+                    else:
+                        self.drawing_engine.stop_drawing()
                 else:
                     self.drawing_engine.stop_drawing()
         elif gesture == Gesture.ERASE:
@@ -388,8 +393,7 @@ class MainWindow(QMainWindow):
         # Handle debounced destructive gestures
         if self.gesture_controller.clear_triggered:
             self.drawing_engine.clear_canvas()
-        if self.gesture_controller.save_triggered:
-            self._on_save()
+            self.status_bar.showMessage("Canvas cleared via gesture.", 3000)
 
         # --- Step 4: Draw HUD on frame ---
         frame = self._draw_hud(frame, gesture)
@@ -613,12 +617,12 @@ class MainWindow(QMainWindow):
             "Gesture Guide",
             "<h3>✋ Gesture Controls</h3>"
             "<table>"
-            "<tr><td><b>☝️ Index Finger</b></td><td>Draw</td></tr>"
+            "<tr><td><b>☝️ Index Finger</b></td><td>Draw (locks on — very stable)</td></tr>"
             "<tr><td><b>✌️ Index + Middle</b></td><td>Selection Mode</td></tr>"
-            "<tr><td><b>🖐️ Open Palm (hold 1s)</b></td><td>Clear Canvas</td></tr>"
-            "<tr><td><b>✊ Fist (hold 1s)</b></td><td>Save Drawing</td></tr>"
-            "<tr><td><b>🤟 Thumb + Middle</b></td><td>Eraser</td></tr>"
+            "<tr><td><b>🖐️ Open Palm (hold 1.5s)</b></td><td>Clear Canvas</td></tr>"
+            "<tr><td><b>🖕 Middle Finger Only</b></td><td>Eraser</td></tr>"
             "</table>"
+            "<br><p><b>💾 Save:</b> Use the Save button or <b>Ctrl+S</b></p>"
             "<br><p><i>Tip: Use Selection mode to pick colors from the header bar!</i></p>"
         )
 
