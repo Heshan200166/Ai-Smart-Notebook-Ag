@@ -170,6 +170,25 @@ class HandTracker:
         if avg_std < 10:
             return False  # All landmarks clustered — not a hand
 
+        # --- Check 5: Palm structure (Fan check) ---
+        # A real hand has the 4 MCPs (index to pinky) roughly forming an arc,
+        # and the wrist is relatively far from this arc compared to the distance between MCPs.
+        index_mcp = coords[5]
+        pinky_mcp = coords[17]
+        
+        mcp_width = np.linalg.norm(index_mcp - pinky_mcp)
+        wrist_to_index = np.linalg.norm(wrist - index_mcp)
+        wrist_to_pinky = np.linalg.norm(wrist - pinky_mcp)
+        
+        # The distance from wrist to MCPs should be larger than the distance between index and pinky MCPs
+        # (Usually wrist-to-MCP is about 1.5x to 2x the MCP width). This prevents bicep false positives.
+        if wrist_to_index < mcp_width * 0.5 or wrist_to_pinky < mcp_width * 0.5:
+            return False
+            
+        # The MCPs shouldn't be too far apart relative to the hand span
+        if mcp_width > hand_span * 0.8:
+            return False
+
         return True
 
     def _detect_orientation(self):
@@ -324,15 +343,11 @@ class HandTracker:
 
     def get_finger_states(self):
         """
-        Determine which fingers are extended using ORIENTATION-AWARE checks.
+        Determine which fingers are extended using ROTATION-INVARIANT checks.
 
-        Detects whether the hand is upright or inverted (pointing down)
-        and adapts the finger detection accordingly. This allows drawing
-        in the full canvas area — both upper and lower regions.
-
-        The primary check uses a rotation-invariant approach:
-        - "Extended" means tip is FURTHER from the palm center than PIP
-        - Combined with directional checks adapted to orientation
+        Detects whether the hand is upright, inverted, or sideways natively by
+        using relative vectors and distances instead of absolute Y coordinates.
+        This allows drawing in the full canvas area without confusion.
         """
         if len(self.landmarks) < 21:
             return [False] * 5
@@ -345,9 +360,6 @@ class HandTracker:
 
         wrist = np.array(self.landmarks[0][1:3])
         index_mcp = np.array(self.landmarks[5][1:3])
-
-        # Direction multiplier: +1 for normal, -1 for inverted
-        direction = -1 if self._hand_inverted else 1
 
         # --- Thumb (special case) ---
         thumb_tip = np.array(self.landmarks[4][1:3])
@@ -373,7 +385,7 @@ class HandTracker:
         thumb_up = self._apply_confidence(0, thumb_up, thumb_votes / 3.0)
         new_states.append(thumb_up)
 
-        # --- Index through Pinky (orientation-aware) ---
+        # --- Index through Pinky (rotation-invariant) ---
         for i, (tip_id, pip_id, mcp_id) in enumerate(
             zip(self.FINGERTIP_IDS[1:], self.FINGER_PIP_IDS[1:], self.FINGER_MCP_IDS[1:]),
             start=1
@@ -383,43 +395,35 @@ class HandTracker:
             mcp = np.array(self.landmarks[mcp_id][1:3])
             wrist_pt = np.array(self.landmarks[0][1:3])
 
-            # === PRIMARY CHECK (orientation-aware) ===
-            # Normal: tip Y < PIP Y (tip above PIP)
-            # Inverted: tip Y > PIP Y (tip below PIP = extended downward)
-            if self._hand_inverted:
-                # Inverted: "extended" means tip is BELOW PIP
-                if i >= 3:
-                    primary_up = tip[1] > (pip[1] + 15)
-                else:
-                    primary_up = tip[1] > pip[1]
-            else:
-                # Normal: "extended" means tip is ABOVE PIP
-                if i >= 3:
-                    primary_up = tip[1] < (pip[1] - 15)
-                else:
-                    primary_up = tip[1] < pip[1]
+            # === ROTATION-INVARIANT CHECKS ===
+            
+            # Check 1: Tip further from palm center than PIP
+            tip_palm = np.linalg.norm(tip - palm_center)
+            pip_palm = np.linalg.norm(pip - palm_center)
+            margin1 = 15 if i >= 3 else 5  # Ring/pinky need more margin
+            check1 = tip_palm > (pip_palm + margin1)
+
+            # Check 2: Tip further from wrist than PIP
+            tip_wrist_dist = np.linalg.norm(tip - wrist_pt)
+            pip_wrist_dist = np.linalg.norm(pip - wrist_pt)
+            margin2 = 1.15 if i >= 3 else 1.05
+            check2 = tip_wrist_dist > pip_wrist_dist * margin2
+
+            # Check 3: Straightness (Angle between MCP->PIP and PIP->TIP)
+            v_mcp_pip = pip - mcp
+            v_pip_tip = tip - pip
+            angle = self._angle_between(v_mcp_pip, v_pip_tip)
+            check3 = angle < 65  # If angle is small, finger is relatively straight
+
+            # Primary requirement: Must be pointing away from palm and wrist
+            primary_up = check1 and check2
 
             if not primary_up:
                 finger_up = False
                 vote_conf = 0.0
             else:
-                # === SECONDARY CHECKS (rotation-invariant) ===
-
-                # Check 2: Tip further from palm center than PIP
-                tip_palm = np.linalg.norm(tip - palm_center)
-                pip_palm = np.linalg.norm(pip - palm_center)
-                check2 = tip_palm > pip_palm * 0.95
-
-                # Check 3: Tip further from wrist than PIP
-                tip_wrist_dist = np.linalg.norm(tip - wrist_pt)
-                pip_wrist_dist = np.linalg.norm(pip - wrist_pt)
-                if i >= 3:
-                    check3 = tip_wrist_dist > pip_wrist_dist * 1.15
-                else:
-                    check3 = tip_wrist_dist > pip_wrist_dist * 1.0
-
-                confirmation_votes = sum([check2, check3])
-                vote_conf = (1.0 + confirmation_votes) / 3.0
+                confirmation_votes = 1 if check3 else 0
+                vote_conf = 0.5 + (confirmation_votes * 0.5)
                 finger_up = True
 
             finger_up = self._apply_confidence(i, finger_up, vote_conf)

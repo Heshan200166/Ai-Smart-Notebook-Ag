@@ -458,16 +458,25 @@ class MainWindow(QMainWindow):
             cv2.circle(frame, (cx, cy), self.COLOR_CIRCLE_RADIUS,
                        color, -1, cv2.LINE_AA)
 
-        # Brush size indicator
-        size_x = self.COLOR_CIRCLE_START_X + len(DrawingEngine.COLOR_LIST) * self.COLOR_CIRCLE_SPACING + 30
-        cv2.circle(frame, (size_x, self.COLOR_CIRCLE_Y),
-                   self.drawing_engine.brush_size,
-                   self.drawing_engine.color, -1, cv2.LINE_AA)
-        cv2.putText(frame, "Size", (size_x - 15, 70),
+        # Brush size selector
+        size_start_x = self.COLOR_CIRCLE_START_X + len(DrawingEngine.COLOR_LIST) * self.COLOR_CIRCLE_SPACING + 30
+        
+        for i, size in enumerate(DrawingEngine.BRUSH_SIZES):
+            cx = size_start_x + i * 40
+            cy = self.COLOR_CIRCLE_Y
+            
+            # Draw outer ring for selected size
+            if i == self.drawing_engine.brush_size_index:
+                cv2.circle(frame, (cx, cy), 18, (255, 255, 255), 2, cv2.LINE_AA)
+                
+            # Draw actual brush size
+            cv2.circle(frame, (cx, cy), size, self.drawing_engine.color, -1, cv2.LINE_AA)
+
+        cv2.putText(frame, "Size", (size_start_x - 15, 70),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.4, (180, 180, 180), 1)
 
         # Eraser indicator
-        eraser_x = size_x + 70
+        eraser_x = size_start_x + len(DrawingEngine.BRUSH_SIZES) * 40 + 30
         eraser_color = (0, 200, 255) if self.drawing_engine.eraser_mode else (100, 100, 100)
         cv2.rectangle(frame, (eraser_x - 25, 20), (eraser_x + 25, 55), eraser_color, -1)
         cv2.putText(frame, "ERA", (eraser_x - 18, 43),
@@ -575,6 +584,17 @@ class MainWindow(QMainWindow):
             dist = np.sqrt((x - cx) ** 2 + (y - cy) ** 2)
             if dist <= self.COLOR_CIRCLE_RADIUS + 5:
                 self._on_color_selected(i)
+                return
+                
+        # Check brush size circles
+        size_start_x = self.COLOR_CIRCLE_START_X + len(DrawingEngine.COLOR_LIST) * self.COLOR_CIRCLE_SPACING + 30
+        for i in range(len(DrawingEngine.BRUSH_SIZES)):
+            cx = size_start_x + i * 40
+            cy = self.COLOR_CIRCLE_Y
+            dist = np.sqrt((x - cx) ** 2 + (y - cy) ** 2)
+            if dist <= 18 + 5:
+                # Triggering the slider will update the drawing engine
+                self.size_slider.setValue(i)
                 return
 
     # =========================================================================
