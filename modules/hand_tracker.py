@@ -1,15 +1,15 @@
 """
-Hand Tracker Module — V3 (Rewritten for Accuracy)
-===================================================
-Uses MediaPipe HandLandmarker in VIDEO mode for temporal tracking,
-with frame preprocessing and robust landmark smoothing.
+Hand Tracker Module — V4 (Orientation-Aware + Body-Part Filtering)
+====================================================================
+Uses MediaPipe HandLandmarker in VIDEO mode for temporal tracking.
 
-Key changes from V2:
-- VIDEO running mode (uses inter-frame tracking for much better accuracy)
-- Frame preprocessing: CLAHE contrast enhancement, brightness normalization
-- Lower confidence thresholds (0.3) for better range
-- Dual-pass detection: retry with enhanced frame on failure
-- Weighted EMA smoothing with velocity damping
+Key improvements:
+- Hand validation: rejects false detections on body parts by checking
+  landmark structure (spread, proportions, finger lengths)
+- Higher detection confidence (0.5) with CLAHE fallback
+- Orientation-aware finger detection: works with hand pointing UP or DOWN
+  so the user can draw in the full canvas area
+- Velocity-adaptive EMA smoothing
 """
 
 import cv2
@@ -29,32 +29,29 @@ from mediapipe.tasks.python.vision import (
 
 
 class HandTracker:
-    """High-accuracy hand tracking using MediaPipe VIDEO mode."""
+    """High-accuracy hand tracking with orientation support."""
 
     # MediaPipe landmark IDs
     FINGERTIP_IDS = [4, 8, 12, 16, 20]       # Thumb, Index, Middle, Ring, Pinky tips
     FINGER_PIP_IDS = [2, 6, 10, 14, 18]      # PIP/IP joints
-    FINGER_MCP_IDS = [1, 5, 9, 13, 17]       # MCP joints (base of each finger)
+    FINGER_MCP_IDS = [1, 5, 9, 13, 17]       # MCP joints
 
     FINGER_NAMES = ["Thumb", "Index", "Middle", "Ring", "Pinky"]
 
     HAND_CONNECTIONS = HandLandmarksConnections.HAND_CONNECTIONS
 
-    def __init__(self, max_hands=1, detection_conf=0.3, tracking_conf=0.3,
+    # --- Hand validation thresholds ---
+    MIN_HAND_SPAN = 40         # Minimum pixel span (width or height) to accept
+    MIN_FINGER_RATIO = 0.15    # Minimum (longest finger / hand span) ratio
+    MAX_ASPECT_RATIO = 4.0     # Maximum width/height or height/width ratio
+
+    def __init__(self, max_hands=1, detection_conf=0.5, tracking_conf=0.4,
                  smoothing_factor=0.55, persistence_frames=8):
         """
-        Initialize the hand tracker with VIDEO mode for temporal tracking.
-
-        Args:
-            max_hands: Maximum number of hands to detect.
-            detection_conf: Minimum detection confidence (low for better catch rate).
-            tracking_conf: Minimum tracking confidence.
-            smoothing_factor: EMA alpha (0=max smooth, 1=no smooth).
-            persistence_frames: Frames to retain landmarks after hand loss.
+        Initialize the hand tracker with validation and orientation support.
         """
         model_path = self._find_model()
 
-        # --- VIDEO mode: uses temporal tracking between frames ---
         options = HandLandmarkerOptions(
             base_options=BaseOptions(model_asset_path=model_path),
             running_mode=RunningMode.VIDEO,
@@ -66,31 +63,32 @@ class HandTracker:
 
         self.detector = HandLandmarker.create_from_options(options)
 
-        # Monotonically increasing timestamp for VIDEO mode
         self._timestamp_ms = 0
 
         self.landmarks = []
-        self.raw_landmarks = []
         self.hand_detected = False
         self._result = None
 
-        # --- Frame preprocessing ---
+        # Frame preprocessing
         self._clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
 
-        # --- Smoothing (Weighted EMA with velocity damping) ---
+        # Smoothing
         self._smoothing_factor = smoothing_factor
-        self._smoothed_coords = None  # np.array (21, 2)
-        self._prev_coords = None      # For velocity calculation
-        self._velocity = None          # np.array (21, 2)
+        self._smoothed_coords = None
+        self._prev_coords = None
+        self._velocity = None
 
-        # --- Persistence ---
+        # Persistence
         self._persistence_frames = persistence_frames
         self._frames_since_detection = 0
         self._last_valid_coords = None
 
-        # --- Finger state tracking with history ---
+        # Finger state tracking
         self._finger_states = [False] * 5
-        self._finger_confidence = [0.0] * 5  # Running confidence per finger
+        self._finger_confidence = [0.0] * 5
+
+        # Hand orientation (updated each frame)
+        self._hand_inverted = False  # True when hand points downward
 
     @staticmethod
     def _find_model():
@@ -109,60 +107,124 @@ class HandTracker:
         )
 
     def _preprocess_frame(self, frame):
-        """
-        Enhance frame for better hand detection.
-        Applies CLAHE contrast enhancement and brightness normalization.
-        """
-        # Convert to LAB color space for luminance-only enhancement
+        """Enhance frame with CLAHE for better detection."""
         lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
         l, a, b = cv2.split(lab)
-
-        # Apply CLAHE to luminance channel
         l_enhanced = self._clahe.apply(l)
-
-        # Merge and convert back
         lab_enhanced = cv2.merge([l_enhanced, a, b])
-        enhanced = cv2.cvtColor(lab_enhanced, cv2.COLOR_LAB2BGR)
+        return cv2.cvtColor(lab_enhanced, cv2.COLOR_LAB2BGR)
 
-        return enhanced
-
-    def _detect_hands(self, frame):
+    def _validate_hand(self, hand_lms, frame_w, frame_h):
         """
-        Run detection with VIDEO mode. Falls back to enhanced frame on failure.
+        Validate that detected landmarks form a plausible hand shape.
+        Rejects false detections on body parts like arms, shoulders, etc.
+
+        Checks:
+        1. Bounding box is large enough (not a tiny noise detection)
+        2. Aspect ratio is reasonable for a hand
+        3. Finger lengths are proportional (at least one finger is long enough)
+        4. Landmarks are spread out (not all clustered in one spot)
 
         Returns:
-            HandLandmarkerResult
+            True if the detection looks like a real hand.
         """
-        self._timestamp_ms += 33  # ~30 FPS increment
+        # Convert to pixel coords
+        coords = np.array([(lm.x * frame_w, lm.y * frame_h) for lm in hand_lms])
 
-        # Convert to RGB
+        # --- Check 1: Bounding box size ---
+        min_xy = coords.min(axis=0)
+        max_xy = coords.max(axis=0)
+        span = max_xy - min_xy
+        width, height = span[0], span[1]
+
+        if width < self.MIN_HAND_SPAN and height < self.MIN_HAND_SPAN:
+            return False  # Too small — likely noise
+
+        # --- Check 2: Aspect ratio ---
+        aspect = max(width, height) / (min(width, height) + 1e-6)
+        if aspect > self.MAX_ASPECT_RATIO:
+            return False  # Too elongated — likely arm/edge
+
+        # --- Check 3: Finger proportions ---
+        wrist = coords[0]
+        # Check at least one finger (tip-to-MCP) is a reasonable fraction of hand span
+        hand_span = max(width, height)
+        has_valid_finger = False
+
+        for tip_id, mcp_id in zip(self.FINGERTIP_IDS[1:], self.FINGER_MCP_IDS[1:]):
+            finger_len = np.linalg.norm(coords[tip_id] - coords[mcp_id])
+            if finger_len / (hand_span + 1e-6) > self.MIN_FINGER_RATIO:
+                has_valid_finger = True
+                break
+
+        if not has_valid_finger:
+            return False  # No recognizable finger structure
+
+        # --- Check 4: Landmark spread ---
+        # Calculate standard deviation of landmark positions
+        # A real hand has landmarks distributed across the area
+        std_x = np.std(coords[:, 0])
+        std_y = np.std(coords[:, 1])
+        avg_std = (std_x + std_y) / 2
+
+        if avg_std < 10:
+            return False  # All landmarks clustered — not a hand
+
+        return True
+
+    def _detect_orientation(self):
+        """
+        Detect hand orientation by checking the wrist-to-middle-MCP vector.
+        If the MCP is below the wrist (in screen coords), hand is inverted.
+
+        Sets self._hand_inverted accordingly.
+        """
+        if len(self.landmarks) < 21:
+            return
+
+        wrist_y = self.landmarks[0][2]       # Landmark 0 = wrist
+        middle_mcp_y = self.landmarks[9][2]  # Landmark 9 = middle finger MCP
+
+        # In screen coords, Y increases downward
+        # Normal: MCP is above wrist (MCP_y < wrist_y)
+        # Inverted: MCP is below wrist (MCP_y > wrist_y)
+        self._hand_inverted = middle_mcp_y > wrist_y
+
+    def _detect_hands(self, frame):
+        """Run detection. Falls back to CLAHE-enhanced frame on failure."""
+        self._timestamp_ms += 33
+
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-
         result = self.detector.detect_for_video(mp_image, self._timestamp_ms)
 
-        # If no hand found, try with preprocessed frame
+        # Validate detection
+        h, w, _ = frame.shape
+        if result.hand_landmarks and len(result.hand_landmarks) > 0:
+            if not self._validate_hand(result.hand_landmarks[0], w, h):
+                # Failed validation — treat as no detection
+                result = type(result)(hand_landmarks=[], hand_world_landmarks=[],
+                                      handedness=[])
+
+        # Fallback: try with enhanced frame
         if not result.hand_landmarks or len(result.hand_landmarks) == 0:
             enhanced = self._preprocess_frame(frame)
             rgb_enhanced = cv2.cvtColor(enhanced, cv2.COLOR_BGR2RGB)
             mp_enhanced = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_enhanced)
 
-            self._timestamp_ms += 1  # Increment again (must be monotonic)
+            self._timestamp_ms += 1
             result = self.detector.detect_for_video(mp_enhanced, self._timestamp_ms)
+
+            # Validate fallback too
+            if result.hand_landmarks and len(result.hand_landmarks) > 0:
+                if not self._validate_hand(result.hand_landmarks[0], w, h):
+                    result = type(result)(hand_landmarks=[], hand_world_landmarks=[],
+                                          handedness=[])
 
         return result
 
     def find_hands(self, frame, draw=True):
-        """
-        Process a frame and optionally draw hand landmarks.
-
-        Args:
-            frame: BGR image from OpenCV.
-            draw: Whether to draw landmarks on the frame.
-
-        Returns:
-            The frame with landmarks drawn.
-        """
+        """Process a frame, validate, and optionally draw landmarks."""
         self._result = self._detect_hands(frame)
 
         raw_detected = bool(
@@ -186,7 +248,6 @@ class HandTracker:
         if raw_detected and draw:
             h, w, _ = frame.shape
             for hand_lms in self._result.hand_landmarks:
-                # Draw connections
                 for connection in self.HAND_CONNECTIONS:
                     start_lm = hand_lms[connection.start]
                     end_lm = hand_lms[connection.end]
@@ -194,7 +255,6 @@ class HandTracker:
                     end_pt = (int(end_lm.x * w), int(end_lm.y * h))
                     cv2.line(frame, start_pt, end_pt, (0, 255, 200), 2, cv2.LINE_AA)
 
-                # Draw landmarks with fingertip highlighting
                 for i, lm in enumerate(hand_lms):
                     px, py = int(lm.x * w), int(lm.y * h)
                     if i in self.FINGERTIP_IDS:
@@ -203,26 +263,19 @@ class HandTracker:
                     else:
                         cv2.circle(frame, (px, py), 4, (0, 200, 255), -1, cv2.LINE_AA)
 
-                # Draw finger state indicators on fingertips
+                # Draw orientation indicator
                 if self.landmarks:
-                    states = self._finger_states
-                    for fi, is_up in enumerate(states):
-                        tip_id = self.FINGERTIP_IDS[fi]
-                        if tip_id < len(self.landmarks):
-                            tx, ty = self.landmarks[tip_id][1], self.landmarks[tip_id][2]
-                            color = (0, 255, 0) if is_up else (0, 0, 255)
-                            cv2.circle(frame, (tx, ty - 15), 5, color, -1, cv2.LINE_AA)
+                    wrist = self.landmarks[0]
+                    indicator_text = "INV" if self._hand_inverted else "NRM"
+                    indicator_color = (0, 165, 255) if self._hand_inverted else (0, 255, 0)
+                    cv2.putText(frame, indicator_text,
+                                (wrist[1] - 15, wrist[2] + 25),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, indicator_color, 1, cv2.LINE_AA)
 
         return frame
 
     def get_landmarks(self, frame):
-        """
-        Extract smoothed landmark positions as pixel coordinates.
-
-        Uses velocity-damped EMA: when the hand moves fast, smoothing
-        decreases for responsiveness. When still, smoothing increases
-        for stability.
-        """
+        """Extract smoothed landmark positions as pixel coordinates."""
         self.landmarks = []
         h, w, _ = frame.shape
 
@@ -238,22 +291,14 @@ class HandTracker:
                 dtype=np.float64
             )
 
-            # --- Velocity-adaptive EMA ---
             if self._smoothed_coords is None:
                 self._smoothed_coords = raw_coords.copy()
                 self._velocity = np.zeros_like(raw_coords)
             else:
-                # Calculate velocity (movement since last frame)
                 self._velocity = raw_coords - self._smoothed_coords
-
-                # Adaptive alpha: faster movement → less smoothing
                 speed = np.linalg.norm(self._velocity, axis=1, keepdims=True)
-                # Normalize speed: 0-10px = slow, 50+px = fast
                 speed_factor = np.clip(speed / 50.0, 0.0, 1.0)
-
-                # Alpha ranges from smoothing_factor (slow) to 0.9 (fast)
                 alpha = self._smoothing_factor + speed_factor * (0.9 - self._smoothing_factor)
-
                 self._smoothed_coords = (
                     alpha * raw_coords + (1 - alpha) * self._smoothed_coords
                 )
@@ -262,46 +307,57 @@ class HandTracker:
             self._prev_coords = raw_coords.copy()
 
         elif self.hand_detected and self._last_valid_coords is not None:
-            # Use persisted coords during brief hand loss
             pass
         else:
             return self.landmarks
 
-        # Build landmark list from smoothed or persisted coords
         coords = self._smoothed_coords if raw_detected else self._last_valid_coords
         if coords is not None:
             for idx in range(21):
                 px, py = int(coords[idx][0]), int(coords[idx][1])
                 self.landmarks.append((idx, px, py))
 
+        # Detect orientation after landmarks are populated
+        self._detect_orientation()
+
         return self.landmarks
 
     def get_finger_states(self):
         """
-        Determine which fingers are up using a primary check with
-        confirmation checks.
+        Determine which fingers are extended using ORIENTATION-AWARE checks.
 
-        Logic:
-        - Check 1 (tip Y above PIP Y) is REQUIRED for a finger to be "up"
-        - Checks 2 and 3 provide confidence weighting
-        - Ring and pinky have stricter thresholds (harder to go up)
-          to prevent false-positive that triggers CLEAR
+        Detects whether the hand is upright or inverted (pointing down)
+        and adapts the finger detection accordingly. This allows drawing
+        in the full canvas area — both upper and lower regions.
+
+        The primary check uses a rotation-invariant approach:
+        - "Extended" means tip is FURTHER from the palm center than PIP
+        - Combined with directional checks adapted to orientation
         """
         if len(self.landmarks) < 21:
             return [False] * 5
 
         new_states = []
 
-        # --- Thumb (special case: uses X axis) ---
-        thumb_tip = np.array(self.landmarks[4][1:3])
-        thumb_ip = np.array(self.landmarks[3][1:3])
-        thumb_mcp = np.array(self.landmarks[2][1:3])
+        # Get palm center (average of wrist + 4 MCP joints)
+        palm_pts = [self.landmarks[i][1:3] for i in [0, 5, 9, 13, 17]]
+        palm_center = np.mean(palm_pts, axis=0)
+
         wrist = np.array(self.landmarks[0][1:3])
         index_mcp = np.array(self.landmarks[5][1:3])
 
-        tip_dist = np.linalg.norm(thumb_tip - wrist)
-        mcp_dist = np.linalg.norm(thumb_mcp - wrist)
-        check1 = tip_dist > mcp_dist * 1.2
+        # Direction multiplier: +1 for normal, -1 for inverted
+        direction = -1 if self._hand_inverted else 1
+
+        # --- Thumb (special case) ---
+        thumb_tip = np.array(self.landmarks[4][1:3])
+        thumb_ip = np.array(self.landmarks[3][1:3])
+        thumb_mcp = np.array(self.landmarks[2][1:3])
+
+        # Thumb check: tip distance from palm center vs MCP distance
+        tip_palm_dist = np.linalg.norm(thumb_tip - palm_center)
+        mcp_palm_dist = np.linalg.norm(thumb_mcp - palm_center)
+        check1 = tip_palm_dist > mcp_palm_dist * 1.2
 
         tip_to_index = np.linalg.norm(thumb_tip - index_mcp)
         mcp_to_index = np.linalg.norm(thumb_mcp - index_mcp)
@@ -317,7 +373,7 @@ class HandTracker:
         thumb_up = self._apply_confidence(0, thumb_up, thumb_votes / 3.0)
         new_states.append(thumb_up)
 
-        # --- Index through Pinky ---
+        # --- Index through Pinky (orientation-aware) ---
         for i, (tip_id, pip_id, mcp_id) in enumerate(
             zip(self.FINGERTIP_IDS[1:], self.FINGER_PIP_IDS[1:], self.FINGER_MCP_IDS[1:]),
             start=1
@@ -327,37 +383,44 @@ class HandTracker:
             mcp = np.array(self.landmarks[mcp_id][1:3])
             wrist_pt = np.array(self.landmarks[0][1:3])
 
-            # PRIMARY CHECK (required): Tip Y must be above PIP Y
-            # For ring (i=3) and pinky (i=4), require a larger margin
-            if i >= 3:
-                # Ring/Pinky: tip must be clearly above PIP (by at least 15px)
-                primary_up = tip[1] < (pip[1] - 15)
+            # === PRIMARY CHECK (orientation-aware) ===
+            # Normal: tip Y < PIP Y (tip above PIP)
+            # Inverted: tip Y > PIP Y (tip below PIP = extended downward)
+            if self._hand_inverted:
+                # Inverted: "extended" means tip is BELOW PIP
+                if i >= 3:
+                    primary_up = tip[1] > (pip[1] + 15)
+                else:
+                    primary_up = tip[1] > pip[1]
             else:
-                # Index/Middle: standard check
-                primary_up = tip[1] < pip[1]
+                # Normal: "extended" means tip is ABOVE PIP
+                if i >= 3:
+                    primary_up = tip[1] < (pip[1] - 15)
+                else:
+                    primary_up = tip[1] < pip[1]
 
             if not primary_up:
-                # Primary check failed → finger is DOWN, no matter what
                 finger_up = False
                 vote_conf = 0.0
             else:
-                # Primary check passed, use secondary checks for confidence
-                # Check 2: Tip Y above MCP Y
-                check2 = tip[1] < mcp[1]
+                # === SECONDARY CHECKS (rotation-invariant) ===
 
-                # Check 3: Tip further from wrist than PIP (stricter)
+                # Check 2: Tip further from palm center than PIP
+                tip_palm = np.linalg.norm(tip - palm_center)
+                pip_palm = np.linalg.norm(pip - palm_center)
+                check2 = tip_palm > pip_palm * 0.95
+
+                # Check 3: Tip further from wrist than PIP
                 tip_wrist_dist = np.linalg.norm(tip - wrist_pt)
                 pip_wrist_dist = np.linalg.norm(pip - wrist_pt)
-                # Ring/Pinky need a much larger margin
                 if i >= 3:
                     check3 = tip_wrist_dist > pip_wrist_dist * 1.15
                 else:
                     check3 = tip_wrist_dist > pip_wrist_dist * 1.0
 
                 confirmation_votes = sum([check2, check3])
-                # With primary + confirmations: total score
                 vote_conf = (1.0 + confirmation_votes) / 3.0
-                finger_up = True  # Primary passed
+                finger_up = True
 
             finger_up = self._apply_confidence(i, finger_up, vote_conf)
             new_states.append(finger_up)
@@ -367,13 +430,7 @@ class HandTracker:
 
     def _apply_confidence(self, finger_idx, raw_up, vote_confidence):
         """
-        Apply confidence-based hysteresis to prevent flickering.
-
-        Index finger (idx=1): rises fast, falls at moderate speed
-        (no longer ultra-sticky — allows prompt draw stop).
-
-        Ring/Pinky (idx=3,4): rises slowly, falls fast
-        (prevents false open-palm detection).
+        Apply confidence-based hysteresis with per-finger tuning.
         """
         current_up = self._finger_states[finger_idx]
         conf = self._finger_confidence[finger_idx]
@@ -383,37 +440,36 @@ class HandTracker:
 
         if raw_up:
             if is_index:
-                rise_rate = 0.5       # Index rises fast
+                rise_rate = 0.5
             elif is_ring_pinky:
-                rise_rate = 0.25      # Ring/Pinky rise slowly (prevent false up)
+                rise_rate = 0.25
             else:
                 rise_rate = 0.4
             conf = min(conf + vote_confidence * rise_rate, 1.0)
         else:
             if is_index:
-                fall_rate = 0.35      # Index falls at moderate speed (was 0.15)
+                fall_rate = 0.35
             elif is_ring_pinky:
-                fall_rate = 0.5       # Ring/Pinky fall fast (eager to go down)
+                fall_rate = 0.5
             else:
                 fall_rate = 0.4
             conf = max(conf - max(vote_confidence, 0.3) * fall_rate, 0.0)
 
         self._finger_confidence[finger_idx] = conf
 
-        # Hysteresis thresholds
         if current_up:
             if is_ring_pinky:
-                down_threshold = 0.4   # Ring/Pinky drop easily
+                down_threshold = 0.4
             elif is_index:
-                down_threshold = 0.25  # Index still somewhat sticky
+                down_threshold = 0.25
             else:
                 down_threshold = 0.3
             return conf >= down_threshold
         else:
             if is_ring_pinky:
-                up_threshold = 0.75    # Ring/Pinky very hard to go up
+                up_threshold = 0.75
             elif is_index:
-                up_threshold = 0.5     # Index goes up readily
+                up_threshold = 0.5
             else:
                 up_threshold = 0.6
             return conf >= up_threshold

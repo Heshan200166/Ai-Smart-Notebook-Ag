@@ -485,9 +485,9 @@ class MainWindow(QMainWindow):
         debug_y = h - 40
         debug_x = 20
 
-        # Background
+        # Background (wider to fit orientation label)
         overlay2 = frame.copy()
-        cv2.rectangle(overlay2, (10, h - 60), (280, h - 10), (20, 20, 30), -1)
+        cv2.rectangle(overlay2, (10, h - 60), (360, h - 10), (20, 20, 30), -1)
         frame = cv2.addWeighted(overlay2, 0.7, frame, 0.3, 0)
 
         for i, (label, is_up) in enumerate(zip(finger_labels, finger_states)):
@@ -496,6 +496,19 @@ class MainWindow(QMainWindow):
             cv2.circle(frame, (x + 10, debug_y), 8, color, -1, cv2.LINE_AA)
             cv2.putText(frame, label, (x - 2, debug_y - 14),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.35, (180, 180, 200), 1)
+
+        # Orientation indicator
+        orient_x = debug_x + 5 * 52 + 10
+        if self.hand_tracker._hand_inverted:
+            cv2.putText(frame, "INV", (orient_x, debug_y - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 165, 255), 1)
+            cv2.putText(frame, "v", (orient_x + 10, debug_y + 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 165, 255), 1)
+        else:
+            cv2.putText(frame, "NRM", (orient_x, debug_y - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
+            cv2.putText(frame, "^", (orient_x + 10, debug_y + 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
 
         return frame
 
