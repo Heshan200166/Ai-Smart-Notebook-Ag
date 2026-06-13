@@ -190,26 +190,26 @@ class MainWindow(QMainWindow):
         tools_layout = QVBoxLayout(tools_group)
         tools_layout.setSpacing(8)
 
-        self.eraser_btn = QPushButton("🧹  Eraser")
+        self.eraser_btn = QPushButton("🧹  Eraser (🖕 Middle)")
         self.eraser_btn.setObjectName("eraserBtn")
         self.eraser_btn.setCheckable(True)
         self.eraser_btn.setFixedHeight(40)
         self.eraser_btn.clicked.connect(self._on_eraser_toggled)
         tools_layout.addWidget(self.eraser_btn)
 
-        self.undo_btn = QPushButton("↩️  Undo")
+        self.undo_btn = QPushButton("↩️  Undo (🤘 Pinky)")
         self.undo_btn.setObjectName("undoBtn")
         self.undo_btn.setFixedHeight(40)
         self.undo_btn.clicked.connect(self._on_undo)
         tools_layout.addWidget(self.undo_btn)
 
-        self.clear_btn = QPushButton("🗑️  Clear Canvas")
+        self.clear_btn = QPushButton("🗑️  Clear Canvas (🖐️ Open Palm)")
         self.clear_btn.setObjectName("clearBtn")
         self.clear_btn.setFixedHeight(40)
         self.clear_btn.clicked.connect(self._on_clear)
         tools_layout.addWidget(self.clear_btn)
 
-        self.save_btn = QPushButton("💾  Save Drawing")
+        self.save_btn = QPushButton("💾  Save Drawing (🤘 Index+Pinky)")
         self.save_btn.setObjectName("saveBtn")
         self.save_btn.setFixedHeight(40)
         self.save_btn.clicked.connect(self._on_save)
@@ -406,6 +406,14 @@ class MainWindow(QMainWindow):
         if self.gesture_controller.clear_triggered:
             self.drawing_engine.clear_canvas()
             self.status_bar.showMessage("Canvas cleared via gesture.", 3000)
+            
+        if self.gesture_controller.undo_triggered:
+            self.drawing_engine.undo()
+            self.status_bar.showMessage("Undo triggered via gesture.", 3000)
+            
+        if self.gesture_controller.save_triggered:
+            self._on_save()
+            self.status_bar.showMessage("Canvas saved via gesture.", 3000)
 
         # --- Step 4: Draw HUD on frame ---
         frame = self._draw_hud(frame, gesture)

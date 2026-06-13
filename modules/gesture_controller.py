@@ -26,6 +26,8 @@ class Gesture:
     SELECT = "select"
     CLEAR = "clear"
     ERASE = "erase"
+    UNDO = "undo"
+    SAVE = "save"
 
 
 class PenState:
@@ -69,6 +71,8 @@ class GestureController:
 
         # Triggered flags
         self.clear_triggered = False
+        self.undo_triggered = False
+        self.save_triggered = False
 
         # --- Stabilization ---
         self._gesture_buffer = deque(maxlen=self.BUFFER_SIZE)
@@ -96,10 +100,14 @@ class GestureController:
         if not finger_states or len(finger_states) != 5:
             self._gesture_buffer.append(Gesture.NONE)
             self.clear_triggered = False
+            self.undo_triggered = False
+            self.save_triggered = False
             self.draw_paused = True  # No hand = no drawing
             return self._apply_inertia(Gesture.NONE)
 
         self.clear_triggered = False
+        self.undo_triggered = False
+        self.save_triggered = False
 
         # Classify raw gesture
         raw = self._classify(finger_states)
@@ -245,11 +253,11 @@ class GestureController:
         non_thumb_up = sum([index, middle, ring, pinky])
 
         # OPEN PALM: 3 or 4 non-thumb fingers up → Clear
-        if non_thumb_up >= 3 and index and middle:
+        if non_thumb_up >= 3 and index and middle and ring:
             return Gesture.CLEAR
 
         # INDEX ONLY: Just index up → Draw
-        if index and not middle:
+        if index and not middle and not ring and not pinky:
             return Gesture.DRAW
 
         # PEACE: Index + Middle, no ring/pinky → Select
@@ -259,6 +267,14 @@ class GestureController:
         # MIDDLE ONLY → Erase
         if middle and not index and not ring and not pinky:
             return Gesture.ERASE
+            
+        # PINKY ONLY → Undo
+        if pinky and not index and not middle and not ring:
+            return Gesture.UNDO
+            
+        # ROCK ON (Index + Pinky) → Save
+        if index and pinky and not middle and not ring:
+            return Gesture.SAVE
 
         return Gesture.NONE
 
@@ -311,30 +327,53 @@ class GestureController:
         return self.current_gesture
 
     def _handle_hold(self, gesture):
-        """Handle hold-to-activate for CLEAR gesture."""
+        """Handle hold-to-activate for gestures requiring confirmation."""
         now = time.time()
         in_cooldown = (now - self._last_trigger_time) < self.COOLDOWN_DURATION
 
-        if gesture == Gesture.CLEAR and not in_cooldown:
-            if self._held_gesture == Gesture.CLEAR:
+        hold_gestures = [Gesture.CLEAR, Gesture.UNDO, Gesture.SAVE]
+        
+        # Determine hold duration based on gesture
+        # Clear: 1.5s, Save: 2.0s, Undo: 1.0s
+        durations = {
+            Gesture.CLEAR: 1.5,
+            Gesture.SAVE: 2.0,
+            Gesture.UNDO: 1.0
+        }
+
+        if gesture in hold_gestures and not in_cooldown:
+            if self._held_gesture == gesture:
                 hold_time = now - self._hold_start_time
-                if hold_time >= self.HOLD_DURATION:
-                    self.clear_triggered = True
+                if hold_time >= durations[gesture]:
+                    # Trigger the action
+                    if gesture == Gesture.CLEAR:
+                        self.clear_triggered = True
+                    elif gesture == Gesture.SAVE:
+                        self.save_triggered = True
+                    elif gesture == Gesture.UNDO:
+                        self.undo_triggered = True
+                        
                     self._last_trigger_time = now
                     self._held_gesture = Gesture.NONE
                     self._gesture_buffer.clear()
             else:
-                self._held_gesture = Gesture.CLEAR
+                self._held_gesture = gesture
                 self._hold_start_time = now
         else:
-            if gesture != Gesture.CLEAR:
+            if gesture not in hold_gestures:
                 self._held_gesture = Gesture.NONE
 
     def get_hold_progress(self):
-        """Get the progress of the CLEAR hold gesture (0.0 to 1.0)."""
-        if self._held_gesture == Gesture.CLEAR:
+        """Get the progress of the active hold gesture (0.0 to 1.0)."""
+        durations = {
+            Gesture.CLEAR: 1.5,
+            Gesture.SAVE: 2.0,
+            Gesture.UNDO: 1.0
+        }
+        
+        if self._held_gesture in durations:
             elapsed = time.time() - self._hold_start_time
-            return min(elapsed / self.HOLD_DURATION, 1.0)
+            return min(elapsed / durations[self._held_gesture], 1.0)
         return 0.0
 
     def get_gesture_display_name(self):
@@ -351,8 +390,10 @@ class GestureController:
 
         names = {
             Gesture.NONE: "No Gesture",
-            Gesture.SELECT: "👆 Selection",
-            Gesture.CLEAR: "🖐️ Hold to Clear",
-            Gesture.ERASE: "🧹 Eraser",
+            Gesture.SELECT: "👆 Selection (Index+Middle)",
+            Gesture.CLEAR: "🖐️ Hold to Clear (Open Palm)",
+            Gesture.ERASE: "🧹 Eraser (Middle)",
+            Gesture.UNDO: "↩️ Hold to Undo (Pinky)",
+            Gesture.SAVE: "💾 Hold to Save (Index+Pinky)",
         }
         return names.get(self.current_gesture, "Unknown")
