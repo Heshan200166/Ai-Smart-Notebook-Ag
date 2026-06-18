@@ -16,7 +16,7 @@ from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QSlider, QFrame, QStatusBar,
     QMessageBox, QGroupBox, QGridLayout, QProgressBar,
-    QSizePolicy, QApplication
+    QSizePolicy, QApplication, QTextEdit
 )
 from PyQt6.QtCore import Qt, QTimer, QSize
 from PyQt6.QtGui import QIcon, QFont, QAction
@@ -26,6 +26,8 @@ from modules.hand_tracker import HandTracker
 from modules.gesture_controller import GestureController, Gesture
 from modules.drawing_engine import DrawingEngine
 from modules.database import NotebookDatabase
+from modules.ai_worker import AIWorker
+from modules.shape_recognizer import ShapeRecognizer
 
 
 class MainWindow(QMainWindow):
@@ -49,6 +51,24 @@ class MainWindow(QMainWindow):
         self.gesture_controller = GestureController()
         self.drawing_engine = DrawingEngine()
         self.database = NotebookDatabase()
+        self.shape_recognizer = ShapeRecognizer()
+
+        # --- AI Worker (background thread) ---
+        self.ai_worker = AIWorker(self)
+        self.ai_worker.text_recognized.connect(self._on_text_recognized)
+        self.ai_worker.math_solved.connect(self._on_math_solved)
+        self.ai_worker.shape_detected.connect(self._on_shape_detected)
+        self.ai_worker.status_message.connect(
+            lambda msg: self.status_bar.showMessage(msg, 5000)
+        )
+        self.ai_worker.error_occurred.connect(
+            lambda msg: self.status_bar.showMessage(msg, 5000)
+        )
+
+        # --- Selection state ---
+        self._selection_start = None
+        self._selection_end = None
+        self._last_ocr_text = ""
 
         # --- Session state ---
         self.session_id = self.database.create_session()
@@ -217,6 +237,41 @@ class MainWindow(QMainWindow):
 
         tool_layout.addWidget(tools_group)
 
+        # --- AI Features ---
+        ai_group = QGroupBox("🧠 AI Features")
+        ai_group.setObjectName("aiGroup")
+        ai_layout = QVBoxLayout(ai_group)
+        ai_layout.setSpacing(8)
+
+        self.auto_snap_btn = QPushButton("📐  Shape Auto-Snap: OFF")
+        self.auto_snap_btn.setObjectName("autoSnapBtn")
+        self.auto_snap_btn.setCheckable(True)
+        self.auto_snap_btn.setFixedHeight(36)
+        self.auto_snap_btn.clicked.connect(self._on_auto_snap_toggled)
+        ai_layout.addWidget(self.auto_snap_btn)
+
+        self.read_text_btn = QPushButton("📝  Read Text (Select Area)")
+        self.read_text_btn.setObjectName("readTextBtn")
+        self.read_text_btn.setFixedHeight(36)
+        self.read_text_btn.clicked.connect(self._on_read_text)
+        ai_layout.addWidget(self.read_text_btn)
+
+        self.solve_math_btn = QPushButton("🧮  Solve Math")
+        self.solve_math_btn.setObjectName("solveMathBtn")
+        self.solve_math_btn.setFixedHeight(36)
+        self.solve_math_btn.clicked.connect(self._on_solve_math)
+        ai_layout.addWidget(self.solve_math_btn)
+
+        # AI results display
+        self.ai_results = QTextEdit()
+        self.ai_results.setObjectName("aiResults")
+        self.ai_results.setReadOnly(True)
+        self.ai_results.setFixedHeight(120)
+        self.ai_results.setPlaceholderText("AI results will appear here...")
+        ai_layout.addWidget(self.ai_results)
+
+        tool_layout.addWidget(ai_group)
+
         # --- Camera controls ---
         cam_group = QGroupBox("Camera")
         cam_group.setObjectName("camGroup")
@@ -370,6 +425,23 @@ class MainWindow(QMainWindow):
 
             # Check if draw is paused (stillness timeout OR finger dropped)
             if self.gesture_controller.draw_paused:
+                # Stroke just ended — check for shape auto-snap
+                if self.drawing_engine.auto_snap_enabled:
+                    stroke_pts = self.drawing_engine.get_last_stroke()
+                    if len(stroke_pts) >= 8:
+                        result = self.shape_recognizer.analyze_stroke(stroke_pts)
+                        if result.shape_type != "unknown":
+                            # Undo the rough stroke and replace with perfect shape
+                            self.drawing_engine.undo()
+                            self.drawing_engine._save_undo_state()
+                            self.shape_recognizer.render_shape(
+                                self.drawing_engine.canvas, result,
+                                self.drawing_engine.color,
+                                self.drawing_engine.brush_size
+                            )
+                            self.status_bar.showMessage(
+                                f"📐 Shape snapped: {result.shape_type} ({result.confidence:.0%})", 3000
+                            )
                 self.drawing_engine.stop_drawing()
             else:
                 if pos:
@@ -394,12 +466,38 @@ class MainWindow(QMainWindow):
                 self.drawing_engine.draw(pos[0], pos[1])
             else:
                 self.drawing_engine.stop_drawing()
+
         elif gesture == Gesture.SELECT:
             pos = self.hand_tracker.get_fingertip_position(1)  # Index finger
-            if pos and pos[1] <= self.HEADER_HEIGHT:
-                self._check_header_selection(pos[0], pos[1])
+            if pos:
+                if pos[1] <= self.HEADER_HEIGHT:
+                    # Header area — color/size selection
+                    self._check_header_selection(pos[0], pos[1])
+                    self._selection_start = None
+                    self._selection_end = None
+                else:
+                    # Canvas area — drag selection rectangle
+                    if self._selection_start is None:
+                        self._selection_start = (int(pos[0]), int(pos[1]))
+                    self._selection_end = (int(pos[0]), int(pos[1]))
             self.drawing_engine.stop_drawing()
+
         else:
+            # If we were selecting and just stopped, finalize the selection
+            if self._selection_start is not None and self._selection_end is not None:
+                sx, sy = self._selection_start
+                ex, ey = self._selection_end
+                w_sel = abs(ex - sx)
+                h_sel = abs(ey - sy)
+                if w_sel > 30 and h_sel > 30:
+                    self.drawing_engine.selection_start = self._selection_start
+                    self.drawing_engine.selection_end = self._selection_end
+                    self.drawing_engine.selection_active = True
+                    self.status_bar.showMessage(
+                        f"✅ Area selected ({w_sel}x{h_sel}px) — Use 'Read Text' or 'Solve Math'", 5000
+                    )
+            self._selection_start = None
+            self._selection_end = None
             self.drawing_engine.stop_drawing()
 
         # Handle debounced destructive gestures
@@ -417,6 +515,23 @@ class MainWindow(QMainWindow):
 
         # --- Step 4: Draw HUD on frame ---
         frame = self._draw_hud(frame, gesture)
+
+        # --- Step 4b: Draw selection rectangle ---
+        if self._selection_start is not None and self._selection_end is not None:
+            frame = self.drawing_engine.draw_selection_rect(
+                frame,
+                self._selection_start[0], self._selection_start[1],
+                self._selection_end[0], self._selection_end[1]
+            )
+        elif self.drawing_engine.selection_active:
+            # Show persisted selection
+            frame = self.drawing_engine.draw_selection_rect(
+                frame,
+                self.drawing_engine.selection_start[0],
+                self.drawing_engine.selection_start[1],
+                self.drawing_engine.selection_end[0],
+                self.drawing_engine.selection_end[1]
+            )
 
         # --- Step 5: Overlay canvas onto frame ---
         frame = self.drawing_engine.get_overlay(frame)
@@ -677,6 +792,99 @@ class MainWindow(QMainWindow):
         self.status_bar.showMessage("New session created.", 3000)
 
     # =========================================================================
+    #  AI Feature Callbacks
+    # =========================================================================
+
+    def _on_auto_snap_toggled(self):
+        """Toggle shape auto-snap mode."""
+        enabled = self.auto_snap_btn.isChecked()
+        self.drawing_engine.auto_snap_enabled = enabled
+        if enabled:
+            self.auto_snap_btn.setText("📐  Shape Auto-Snap: ON")
+            self.status_bar.showMessage("Shape auto-snap enabled — draw shapes and they'll snap!", 3000)
+        else:
+            self.auto_snap_btn.setText("📐  Shape Auto-Snap: OFF")
+            self.status_bar.showMessage("Shape auto-snap disabled.", 3000)
+
+    def _on_read_text(self):
+        """Trigger OCR on the selected canvas region."""
+        if self.ai_worker.is_busy():
+            self.status_bar.showMessage("⏳ AI is already processing...", 3000)
+            return
+
+        if self.drawing_engine.selection_active:
+            # Use the selection rectangle
+            sx, sy = self.drawing_engine.selection_start
+            ex, ey = self.drawing_engine.selection_end
+            region = self.drawing_engine.get_region(sx, sy, ex, ey)
+        else:
+            # Use the entire canvas
+            if not self.drawing_engine.has_content():
+                self.status_bar.showMessage("Canvas is empty — nothing to read.", 3000)
+                return
+            region = self.drawing_engine.canvas.copy()
+
+        if region is None:
+            self.status_bar.showMessage("⚠️ Selection area too small.", 3000)
+            return
+
+        self.ai_worker.process_ocr(region)
+
+    def _on_solve_math(self):
+        """Trigger math solving on OCR text or selected region."""
+        if self.ai_worker.is_busy():
+            self.status_bar.showMessage("⏳ AI is already processing...", 3000)
+            return
+
+        # If we have OCR text already, solve it directly
+        if self._last_ocr_text and not self._last_ocr_text.startswith("["):
+            self.ai_worker.process_math(self._last_ocr_text)
+        elif self.drawing_engine.selection_active:
+            # OCR + Math combined
+            sx, sy = self.drawing_engine.selection_start
+            ex, ey = self.drawing_engine.selection_end
+            region = self.drawing_engine.get_region(sx, sy, ex, ey)
+            if region is not None:
+                self.ai_worker.process_ocr_and_math(region)
+            else:
+                self.status_bar.showMessage("⚠️ Selection area too small.", 3000)
+        elif self.drawing_engine.has_content():
+            # Use entire canvas
+            self.ai_worker.process_ocr_and_math(self.drawing_engine.canvas.copy())
+        else:
+            self.status_bar.showMessage("Canvas is empty — nothing to solve.", 3000)
+
+    def _on_text_recognized(self, text):
+        """Handle OCR result from AI worker."""
+        self._last_ocr_text = text
+        self.ai_results.clear()
+        self.ai_results.append(f"📝 <b>Recognized Text:</b>")
+        self.ai_results.append(f"<pre>{text}</pre>")
+
+        # Clear selection after reading
+        self.drawing_engine.selection_active = False
+
+    def _on_math_solved(self, result):
+        """Handle math result from AI worker."""
+        self.ai_results.append(f"\n🧮 <b>Math Result:</b>")
+        if result.success:
+            self.ai_results.append(f"<pre>{result.expression} = {result.solution}</pre>")
+            # Save to database
+            self.database.save_equation(
+                self.session_id, result.expression, result.solution
+            )
+        else:
+            self.ai_results.append(f"<i>⚠️ {result.error}</i>")
+
+    def _on_shape_detected(self, result):
+        """Handle shape detection result from AI worker."""
+        if result.shape_type != "unknown":
+            self.ai_results.append(
+                f"📐 Shape: <b>{result.shape_type}</b> "
+                f"(confidence: {result.confidence:.0%})"
+            )
+
+    # =========================================================================
     #  Utility
     # =========================================================================
 
@@ -711,10 +919,11 @@ class MainWindow(QMainWindow):
             self,
             "About AI Smart Air Notebook",
             "<h2>AI Smart Air Notebook</h2>"
-            "<p>Version 1.0 — Phase 1</p>"
+            "<p>Version 2.0 — Phase 2 (AI Intelligence)</p>"
             "<p>An intelligent touchless note-taking system using "
-            "hand gestures and computer vision.</p>"
-            "<p><b>Technologies:</b> MediaPipe, OpenCV, PyQt6, SQLite</p>"
+            "hand gestures, computer vision, and AI.</p>"
+            "<p><b>Technologies:</b> MediaPipe, OpenCV, PyQt6, EasyOCR, SymPy, SQLite</p>"
+            "<p><b>AI Features:</b> Shape Recognition, OCR, Math Solver</p>"
         )
 
     def _show_gesture_guide(self):
@@ -725,9 +934,11 @@ class MainWindow(QMainWindow):
             "<h3>✋ Gesture Controls</h3>"
             "<table>"
             "<tr><td><b>☝️ Index Finger</b></td><td>Draw Mode</td></tr>"
-            "<tr><td><b>✌️ Index + Middle</b></td><td>Selection Mode</td></tr>"
+            "<tr><td><b>✌️ Index + Middle</b></td><td>Selection Mode (Header: color/size, Canvas: area select)</td></tr>"
             "<tr><td><b>🖐️ Open Palm (hold 1.5s)</b></td><td>Clear Canvas</td></tr>"
             "<tr><td><b>🖕 Middle Finger Only</b></td><td>Eraser</td></tr>"
+            "<tr><td><b>🤙 Pinky Only (hold 1s)</b></td><td>Undo</td></tr>"
+            "<tr><td><b>🤘 Index + Pinky (hold 2s)</b></td><td>Save Canvas</td></tr>"
             "</table>"
             "<br><h4>✏️ How Drawing Works</h4>"
             "<ol>"
@@ -738,8 +949,14 @@ class MainWindow(QMainWindow):
             "<li>Move to next letter position (no lines drawn)</li>"
             "<li>Hold still 1s again → pen DOWN, start next letter</li>"
             "</ol>"
-            "<br><p><b>💾 Save:</b> Use the Save button or <b>Ctrl+S</b></p>"
-            "<br><p><i>Tip: Use Selection mode to pick colors from the header bar!</i></p>"
+            "<br><h4>🧠 AI Features</h4>"
+            "<ul>"
+            "<li><b>Shape Auto-Snap:</b> Toggle ON → rough circles/rectangles auto-snap to perfect shapes</li>"
+            "<li><b>Read Text:</b> Select an area (✌️ below header), then click 'Read Text' for OCR</li>"
+            "<li><b>Solve Math:</b> Write an equation, Read Text, then click 'Solve Math'</li>"
+            "</ul>"
+            "<br><p><b>💾 Save:</b> Use the Save button, <b>Ctrl+S</b>, or 🤘 gesture</p>"
+            "<br><p><i>Tip: Use Selection mode below the header to select canvas areas for AI!</i></p>"
         )
 
     # =========================================================================
@@ -917,6 +1134,49 @@ class MainWindow(QMainWindow):
             QLabel {
                 color: #c0c0d0;
                 font-size: 13px;
+            }
+
+            /* === AI Features Panel === */
+            #autoSnapBtn {
+                background-color: #1a1a2e;
+                border: 1px solid #6a3aaa;
+                color: #b080ff;
+            }
+            #autoSnapBtn:checked {
+                background-color: #2a1a4a;
+                border: 1px solid #9060ff;
+                color: #c0a0ff;
+            }
+            #autoSnapBtn:hover {
+                background-color: #2a2050;
+            }
+
+            #readTextBtn {
+                background-color: #0a1a2a;
+                border: 1px solid #2080cc;
+                color: #60c0ff;
+            }
+            #readTextBtn:hover {
+                background-color: #0e2a3a;
+            }
+
+            #solveMathBtn {
+                background-color: #2a1a0a;
+                border: 1px solid #cc8020;
+                color: #ffb060;
+            }
+            #solveMathBtn:hover {
+                background-color: #3a2a10;
+            }
+
+            #aiResults {
+                background-color: #0a0a14;
+                color: #c0c0d0;
+                border: 1px solid #1e1e30;
+                border-radius: 8px;
+                padding: 8px;
+                font-family: 'Consolas', 'Courier New', monospace;
+                font-size: 12px;
             }
         """)
 

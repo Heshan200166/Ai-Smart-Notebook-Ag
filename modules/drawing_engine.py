@@ -83,6 +83,15 @@ class DrawingEngine:
         # Track if a stroke has been started (for undo grouping)
         self._stroke_active = False
 
+        # --- Stroke recording (for shape recognition) ---
+        self._current_stroke_points = []   # Points of the current stroke
+        self.auto_snap_enabled = False     # Shape auto-snap toggle
+
+        # --- Selection rectangle ---
+        self.selection_start = None        # (x, y) or None
+        self.selection_end = None          # (x, y) or None
+        self.selection_active = False
+
     @property
     def _jump_threshold(self):
         """Adaptive jump threshold based on brush size."""
@@ -143,6 +152,9 @@ class DrawingEngine:
 
         self._prev_point = (sx, sy)
 
+        # Record point for shape recognition
+        self._current_stroke_points.append((sx, sy))
+
     def _draw_smooth_line(self, color, thickness):
         """
         Draw a smooth line using quadratic Bézier interpolation
@@ -184,6 +196,109 @@ class DrawingEngine:
         self._smooth_y = None
         self._point_buffer.clear()
         self._stroke_active = False
+
+    def get_last_stroke(self):
+        """
+        Get the points of the most recently completed stroke
+        and clear the buffer.
+
+        Returns:
+            List of (x, y) tuples, or empty list.
+        """
+        points = list(self._current_stroke_points)
+        self._current_stroke_points.clear()
+        return points
+
+    def get_region(self, x1, y1, x2, y2):
+        """
+        Crop a rectangular region from the canvas.
+
+        Args:
+            x1, y1: Top-left corner.
+            x2, y2: Bottom-right corner.
+
+        Returns:
+            Cropped numpy array (BGR), or None if invalid.
+        """
+        # Normalize coordinates
+        left = max(0, min(x1, x2))
+        top = max(0, min(y1, y2))
+        right = min(self.width, max(x1, x2))
+        bottom = min(self.height, max(y1, y2))
+
+        if right - left < 10 or bottom - top < 10:
+            return None
+
+        return self.canvas[top:bottom, left:right].copy()
+
+    def draw_selection_rect(self, frame, x1, y1, x2, y2):
+        """
+        Draw an animated dashed selection rectangle on the frame.
+
+        Args:
+            frame: The camera frame to draw on.
+            x1, y1: Start corner.
+            x2, y2: End corner.
+
+        Returns:
+            Frame with selection rectangle drawn.
+        """
+        import time
+
+        # Normalize
+        left = min(x1, x2)
+        top = min(y1, y2)
+        right = max(x1, x2)
+        bottom = max(y1, y2)
+
+        # Animated dash offset
+        dash_len = 10
+        gap_len = 8
+        offset = int(time.time() * 30) % (dash_len + gap_len)
+
+        # Draw dashed rectangle
+        color = (0, 255, 255)  # Cyan
+        thickness = 2
+
+        # Draw each side with dashes
+        edges = [
+            ((left, top), (right, top)),      # Top
+            ((right, top), (right, bottom)),   # Right
+            ((right, bottom), (left, bottom)), # Bottom
+            ((left, bottom), (left, top)),     # Left
+        ]
+
+        for (sx, sy), (ex, ey) in edges:
+            dx = ex - sx
+            dy = ey - sy
+            length = max(abs(dx), abs(dy))
+            if length == 0:
+                continue
+
+            step_x = dx / length
+            step_y = dy / length
+
+            i = offset
+            while i < length:
+                seg_start = (int(sx + step_x * i), int(sy + step_y * i))
+                seg_end_i = min(i + dash_len, length)
+                seg_end = (int(sx + step_x * seg_end_i), int(sy + step_y * seg_end_i))
+                cv2.line(frame, seg_start, seg_end, color, thickness, cv2.LINE_AA)
+                i += dash_len + gap_len
+
+        # Semi-transparent fill
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (left, top), (right, bottom), color, -1)
+        frame = cv2.addWeighted(overlay, 0.08, frame, 0.92, 0)
+
+        # Dimension text
+        w = right - left
+        h = bottom - top
+        dim_text = f"{w}x{h}px"
+        cv2.putText(frame, dim_text, (left, top - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
+
+        return frame
 
     def set_color(self, color_index):
         """
