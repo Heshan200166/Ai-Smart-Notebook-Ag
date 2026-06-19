@@ -9,6 +9,7 @@ Supports:
 - Equations: x^2 - 4 = 0 → x = ±2
 - Percentages: 25% of 200
 - Square roots: √16, sqrt(16)
+- OCR-friendly: tolerates misreads like 'O' → '0', 'l' → '1'
 """
 
 import re
@@ -35,18 +36,28 @@ class MathSolver:
         r'sqrt|√',                           # square root
         r'\d+\s*%',                          # percentage
         r'x\s*[\+\-\*\/\^]',                # variable expressions
+        r'\d+\s*[xX]\s*\d+',                # multiplication with x
     ]
 
-    # Symbol normalization map
-    SYMBOL_MAP = {
-        '×': '*',
+    # OCR misread corrections (applied before math parsing)
+    OCR_CORRECTIONS = {
+        'O': '0', 'o': '0',
+        'l': '1', 'I': '1', '|': '1',
+        'S': '5', 's': '5',
+        'B': '8',
+        'Z': '2', 'z': '2',
+        'g': '9', 'q': '9',
+        'A': '4',
+        'T': '7',
+        '×': '*', '✕': '*', 'X': '*',
         '÷': '/',
+        '−': '-', '–': '-', '—': '-',
         '^': '**',
         '√': 'sqrt',
-        'x': 'x',       # Keep as variable
-        'X': 'x',
         '²': '**2',
         '³': '**3',
+        '{': '(', '}': ')',
+        '[': '(', ']': ')',
     }
 
     def solve(self, text: str) -> MathResult:
@@ -94,13 +105,10 @@ class MathSolver:
         """
         Normalize OCR text into a valid math expression.
 
-        Handles common OCR misreads and symbol variations.
+        Very forgiving — handles common OCR misreads, stray characters,
+        and multiple notation styles for operators.
         """
         result = text.strip()
-
-        # Apply symbol map
-        for old, new in self.SYMBOL_MAP.items():
-            result = result.replace(old, new)
 
         # Handle percentage: "25% of 200" → "(25/100)*200"
         pct_match = re.match(r'(\d+(?:\.\d+)?)\s*%\s*(?:of\s+)?(\d+(?:\.\d+)?)', result, re.IGNORECASE)
@@ -113,14 +121,61 @@ class MathSolver:
         if pct_simple:
             return f"{pct_simple.group(1)}/100"
 
+        # Step 1: Detect if 'x' is being used as a variable (in equations)
+        has_equation = '=' in result
+        has_variable_x = bool(re.search(r'x\s*[\*\*\^²]|x\s*[+\-]|[+\-]\s*x|\bx\b\s*=', result, re.IGNORECASE))
+
+        # Step 2: Extract and protect math function names FIRST
+        # Find all function-like words and mark their positions
+        func_names = ['sqrt', 'sin', 'cos', 'tan', 'log', 'ln', 'abs']
+        found_funcs = []
+        lower_result = result.lower()
+        for fn in func_names:
+            idx = lower_result.find(fn)
+            while idx != -1:
+                found_funcs.append((idx, idx + len(fn), fn))
+                idx = lower_result.find(fn, idx + 1)
+
+        # Build character list, protecting function characters
+        protected_indices = set()
+        for start, end, _ in found_funcs:
+            for i in range(start, end):
+                protected_indices.add(i)
+
+        # Step 3: Apply OCR corrections character by character
+        # BUT skip characters that are part of function names
+        normalized = []
+        for i, ch in enumerate(result):
+            if i in protected_indices:
+                normalized.append(ch.lower())  # Keep function chars as-is (lowercase)
+            elif ch in self.OCR_CORRECTIONS:
+                if ch.lower() == 'x' and (has_equation or has_variable_x):
+                    normalized.append('x')
+                else:
+                    normalized.append(self.OCR_CORRECTIONS[ch])
+            else:
+                normalized.append(ch)
+        result = ''.join(normalized)
+
         # Handle sqrt notation: "sqrt16" → "sqrt(16)"
         result = re.sub(r'sqrt\s*(\d+)', r'sqrt(\1)', result)
 
-        # Remove non-math characters (keep digits, operators, parentheses, x, ., =)
-        result = re.sub(r'[^0-9+\-*/().=x\s]', '', result)
+        # Step 4: Extract just math characters
+        # Keep: digits, operators, parens, x, dots, equals, spaces, AND function letters
+        result = re.sub(r'[^0-9a-z+\-*/().=\s]', '', result)
 
-        # Clean up whitespace
-        result = result.strip()
+        # Step 5: Fix common OCR spacing issues
+        # Add * between number and opening paren: "2(3)" → "2*(3)"
+        result = re.sub(r'(\d)\s*\(', r'\1*(', result)
+        # Add * between closing paren and number: "(3)2" → "(3)*2"
+        result = re.sub(r'\)\s*(\d)', r')*\1', result)
+
+        # Step 5: Clean up multiple spaces and operators
+        result = re.sub(r'\s+', ' ', result).strip()
+        # Remove trailing operators
+        result = re.sub(r'[+\-*/]+$', '', result).strip()
+        # Remove leading operators (except minus for negative)
+        result = re.sub(r'^[+*/]+', '', result).strip()
 
         return result
 
@@ -212,6 +267,13 @@ class MathSolver:
         """
         if not text or len(text.strip()) < 2:
             return False
+
+        # Check if it has at least one digit and one operator
+        has_digit = bool(re.search(r'\d', text))
+        has_operator = bool(re.search(r'[+\-*/=^×÷%]', text))
+
+        if has_digit and has_operator:
+            return True
 
         for pattern in self.MATH_PATTERNS:
             if re.search(pattern, text, re.IGNORECASE):

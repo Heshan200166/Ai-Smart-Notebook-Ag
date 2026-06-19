@@ -11,6 +11,7 @@ import sys
 import os
 import time
 import numpy as np
+from collections import deque
 
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -40,6 +41,12 @@ class MainWindow(QMainWindow):
     COLOR_CIRCLE_START_X = 40
     COLOR_CIRCLE_SPACING = 55
 
+    # Selection gesture hold constants (for math mode hold-to-select)
+    SELECT_STILL_TIMEOUT = 1.0    # Seconds to hold still to anchor / finalize
+    SELECT_STILL_RADIUS = 22.0    # px spread → hand is still
+    SELECT_MOVE_RADIUS = 35.0     # px spread → hand is moving
+    SELECT_WINDOW_SIZE = 14       # Position history window size
+
     def __init__(self):
         super().__init__()
 
@@ -65,10 +72,18 @@ class MainWindow(QMainWindow):
             lambda msg: self.status_bar.showMessage(msg, 5000)
         )
 
-        # --- Selection state ---
+        # --- Selection state (legacy — used by drawing_engine display) ---
         self._selection_start = None
         self._selection_end = None
         self._last_ocr_text = ""
+        self._math_mode = False  # When True, selection uses hold-to-select
+
+        # --- Select gesture state machine (hold-to-select for math mode) ---
+        # Phase: 'idle' → 'anchoring' → 'dragging' → 'finalizing' → 'done'
+        self._select_phase = 'idle'
+        self._select_still_timer = None
+        self._select_pos_history = deque(maxlen=self.SELECT_WINDOW_SIZE)
+        self._select_anchor = None
 
         # --- Session state ---
         self.session_id = self.database.create_session()
@@ -153,59 +168,8 @@ class MainWindow(QMainWindow):
 
         tool_layout.addWidget(gesture_group)
 
-        # --- Color palette ---
-        color_group = QGroupBox("Color Palette")
-        color_group.setObjectName("colorGroup")
-        color_grid = QGridLayout(color_group)
-        color_grid.setSpacing(8)
-
-        self.color_buttons = []
-        for i, (name, bgr) in enumerate(DrawingEngine.COLORS.items()):
-            btn = QPushButton()
-            btn.setFixedSize(45, 45)
-            btn.setToolTip(name)
-            r, g, b = bgr[2], bgr[1], bgr[0]  # BGR → RGB
-            btn.setStyleSheet(f"""
-                QPushButton {{
-                    background-color: rgb({r},{g},{b});
-                    border: 3px solid transparent;
-                    border-radius: 8px;
-                }}
-                QPushButton:hover {{
-                    border: 3px solid #ffffff;
-                }}
-            """)
-            btn.clicked.connect(lambda checked, idx=i: self._on_color_selected(idx))
-            color_grid.addWidget(btn, i // 4, i % 4)
-            self.color_buttons.append(btn)
-
-        tool_layout.addWidget(color_group)
-
-        # Highlight default color
-        self._highlight_color_button(0)
-
-        # --- Brush size ---
-        size_group = QGroupBox("Brush Size")
-        size_group.setObjectName("sizeGroup")
-        size_layout = QVBoxLayout(size_group)
-
-        self.size_slider = QSlider(Qt.Orientation.Horizontal)
-        self.size_slider.setMinimum(0)
-        self.size_slider.setMaximum(len(DrawingEngine.BRUSH_SIZES) - 1)
-        self.size_slider.setValue(1)
-        self.size_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
-        self.size_slider.setTickInterval(1)
-        self.size_slider.valueChanged.connect(self._on_brush_size_changed)
-        size_layout.addWidget(self.size_slider)
-
-        self.size_label = QLabel(f"Size: {DrawingEngine.BRUSH_SIZES[1]}px")
-        self.size_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        size_layout.addWidget(self.size_label)
-
-        tool_layout.addWidget(size_group)
-
         # --- Tool buttons ---
-        tools_group = QGroupBox("Tools")
+        tools_group = QGroupBox("Tools (use ✌️ gesture in header)")
         tools_group.setObjectName("toolsGroup")
         tools_layout = QVBoxLayout(tools_group)
         tools_layout.setSpacing(8)
@@ -213,25 +177,25 @@ class MainWindow(QMainWindow):
         self.eraser_btn = QPushButton("🧹  Eraser (🖕 Middle)")
         self.eraser_btn.setObjectName("eraserBtn")
         self.eraser_btn.setCheckable(True)
-        self.eraser_btn.setFixedHeight(40)
+        self.eraser_btn.setFixedHeight(36)
         self.eraser_btn.clicked.connect(self._on_eraser_toggled)
         tools_layout.addWidget(self.eraser_btn)
 
         self.undo_btn = QPushButton("↩️  Undo (🤘 Pinky)")
         self.undo_btn.setObjectName("undoBtn")
-        self.undo_btn.setFixedHeight(40)
+        self.undo_btn.setFixedHeight(36)
         self.undo_btn.clicked.connect(self._on_undo)
         tools_layout.addWidget(self.undo_btn)
 
-        self.clear_btn = QPushButton("🗑️  Clear Canvas (🖐️ Open Palm)")
+        self.clear_btn = QPushButton("🗑️  Clear Canvas (🖐️ Palm)")
         self.clear_btn.setObjectName("clearBtn")
-        self.clear_btn.setFixedHeight(40)
+        self.clear_btn.setFixedHeight(36)
         self.clear_btn.clicked.connect(self._on_clear)
         tools_layout.addWidget(self.clear_btn)
 
-        self.save_btn = QPushButton("💾  Save Drawing (🤘 Index+Pinky)")
+        self.save_btn = QPushButton("💾  Save (🤘 Index+Pinky)")
         self.save_btn.setObjectName("saveBtn")
-        self.save_btn.setFixedHeight(40)
+        self.save_btn.setFixedHeight(36)
         self.save_btn.clicked.connect(self._on_save)
         tools_layout.addWidget(self.save_btn)
 
@@ -262,12 +226,12 @@ class MainWindow(QMainWindow):
         self.solve_math_btn.clicked.connect(self._on_solve_math)
         ai_layout.addWidget(self.solve_math_btn)
 
-        # AI results display
+        # AI results display — large and readable
         self.ai_results = QTextEdit()
         self.ai_results.setObjectName("aiResults")
         self.ai_results.setReadOnly(True)
-        self.ai_results.setFixedHeight(120)
-        self.ai_results.setPlaceholderText("AI results will appear here...")
+        self.ai_results.setMinimumHeight(200)
+        self.ai_results.setPlaceholderText("AI results will appear here...\n\n📝 Select area with ✌️ then click Read Text\n🧮 Or select Math Solver in header, then select equation area")
         ai_layout.addWidget(self.ai_results)
 
         tool_layout.addWidget(ai_group)
@@ -279,7 +243,7 @@ class MainWindow(QMainWindow):
 
         self.cam_btn = QPushButton("📷  Stop Camera")
         self.cam_btn.setObjectName("camBtn")
-        self.cam_btn.setFixedHeight(40)
+        self.cam_btn.setFixedHeight(36)
         self.cam_btn.clicked.connect(self._toggle_camera)
         cam_layout.addWidget(self.cam_btn)
 
@@ -471,33 +435,28 @@ class MainWindow(QMainWindow):
             pos = self.hand_tracker.get_fingertip_position(1)  # Index finger
             if pos:
                 if pos[1] <= self.HEADER_HEIGHT:
-                    # Header area — color/size selection
+                    # Header area — color/size/math button selection
                     self._check_header_selection(pos[0], pos[1])
-                    self._selection_start = None
-                    self._selection_end = None
+                    self._reset_select_state()
+                elif self._math_mode:
+                    # Canvas area + math mode — hold-to-select state machine
+                    self._update_select_gesture(pos, frame)
                 else:
-                    # Canvas area — drag selection rectangle
-                    if self._selection_start is None:
-                        self._selection_start = (int(pos[0]), int(pos[1]))
-                    self._selection_end = (int(pos[0]), int(pos[1]))
+                    # Canvas area without math mode — no-op (no accidental box)
+                    self._reset_select_state()
+            else:
+                self._reset_select_state()
             self.drawing_engine.stop_drawing()
 
         else:
-            # If we were selecting and just stopped, finalize the selection
-            if self._selection_start is not None and self._selection_end is not None:
-                sx, sy = self._selection_start
-                ex, ey = self._selection_end
-                w_sel = abs(ex - sx)
-                h_sel = abs(ey - sy)
-                if w_sel > 30 and h_sel > 30:
-                    self.drawing_engine.selection_start = self._selection_start
-                    self.drawing_engine.selection_end = self._selection_end
-                    self.drawing_engine.selection_active = True
-                    self.status_bar.showMessage(
-                        f"✅ Area selected ({w_sel}x{h_sel}px) — Use 'Read Text' or 'Solve Math'", 5000
-                    )
-            self._selection_start = None
-            self._selection_end = None
+            # Gesture changed away from SELECT / DRAW
+            # Cancel any in-progress selection drag gracefully
+            if self._select_phase == 'dragging':
+                self.status_bar.showMessage(
+                    "Selection cancelled — hold still to confirm next time", 2000
+                )
+            if self._select_phase != 'done':
+                self._reset_select_state()
             self.drawing_engine.stop_drawing()
 
         # Handle debounced destructive gestures
@@ -605,11 +564,31 @@ class MainWindow(QMainWindow):
         cv2.putText(frame, "ERA", (eraser_x - 18, 43),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
+        # Math solver button (next to eraser)
+        self._math_btn_x = eraser_x + 70
+        math_color = (0, 180, 255) if self._math_mode else (100, 100, 100)
+        cv2.rectangle(frame, (self._math_btn_x - 28, 18), (self._math_btn_x + 28, 57), math_color, -1)
+        # Rounded corners effect
+        cv2.rectangle(frame, (self._math_btn_x - 28, 18), (self._math_btn_x + 28, 57), 
+                      (255, 255, 255) if self._math_mode else (60, 60, 60), 1)
+        cv2.putText(frame, "MATH", (self._math_btn_x - 22, 43),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+
+        # Label under buttons
+        cv2.putText(frame, "Tools", (eraser_x - 25, 70),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.35, (180, 180, 180), 1)
+
         # Gesture hint text (right side)
         hint = self.gesture_controller.get_gesture_display_name()
         text_size = cv2.getTextSize(hint, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)[0]
         cv2.putText(frame, hint, (w - text_size[0] - 20, 45),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 200), 1, cv2.LINE_AA)
+
+        # Math mode indicator
+        if self._math_mode:
+            cv2.putText(frame, "MATH MODE: Select equation area with gesture", 
+                        (w - 420, 70),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 180, 255), 1, cv2.LINE_AA)
 
         # --- Finger state debug overlay (bottom-left) ---
         finger_states = self.hand_tracker.get_finger_states()
@@ -716,50 +695,188 @@ class MainWindow(QMainWindow):
             cy = self.COLOR_CIRCLE_Y
             dist = np.sqrt((x - cx) ** 2 + (y - cy) ** 2)
             if dist <= 18 + 5:
-                # Triggering the slider will update the drawing engine
-                self.size_slider.setValue(i)
+                self.drawing_engine.set_brush_size(i)
                 return
+
+        # Check MATH button
+        if hasattr(self, '_math_btn_x'):
+            if abs(x - self._math_btn_x) <= 30 and 15 <= y <= 60:
+                self._math_mode = not self._math_mode
+                if self._math_mode:
+                    self.status_bar.showMessage(
+                        "🧮 Math Mode ON — Use ✌️ gesture below header to select equation area", 5000
+                    )
+                else:
+                    self.status_bar.showMessage("🧮 Math Mode OFF", 3000)
+                return
+
+    # =========================================================================
+    #  Hold-To-Select State Machine (Math Mode Canvas Selection)
+    # =========================================================================
+
+    def _reset_select_state(self):
+        """Reset the selection gesture state machine entirely."""
+        self._select_phase = 'idle'
+        self._select_still_timer = None
+        self._select_pos_history.clear()
+        self._select_anchor = None
+        self._selection_start = None
+        self._selection_end = None
+
+    def _compute_spread(self, pos_history):
+        """
+        Compute the max deviation of any position from the centroid.
+        Returns 0 if fewer than 2 points.
+        This metric is robust to pinpoint jitter since all N recent points
+        must be spread out before the spread value rises.
+        """
+        if len(pos_history) < 2:
+            return 0.0
+        pts = np.array(list(pos_history))
+        centroid = pts.mean(axis=0)
+        return float(np.linalg.norm(pts - centroid, axis=1).max())
+
+    def _update_select_gesture(self, pos, frame):
+        """
+        Hold-to-select state machine for math mode selection.
+
+        Workflow (identical feel to DRAW pen up/down):
+          1. Enter canvas with ✌️ → phase 'idle'
+          2. Hold still 1s → anchor confirmed (green ring fills)
+          3. Move hand → rubber-band drags from anchor
+          4. Hold still 1s → solve triggered (orange ring fills)
+        """
+        now = time.time()
+        x, y = int(pos[0]), int(pos[1])
+
+        self._select_pos_history.append((x, y))
+        spread = self._compute_spread(self._select_pos_history)
+
+        is_still = spread < self.SELECT_STILL_RADIUS
+        is_moving = spread > self.SELECT_MOVE_RADIUS
+
+        if self._select_phase == 'idle':
+            # Waiting for first hold-still to set anchor
+            if is_still:
+                if self._select_still_timer is None:
+                    self._select_still_timer = now
+                progress = min(
+                    (now - self._select_still_timer) / self.SELECT_STILL_TIMEOUT, 1.0
+                )
+                self._draw_select_ring(frame, (x, y), progress, (0, 220, 0), 'Anchor')
+                if progress >= 1.0:
+                    # Anchor confirmed!
+                    self._select_anchor = (x, y)
+                    self._selection_start = (x, y)
+                    self._selection_end = (x, y)
+                    self._select_phase = 'dragging'
+                    self._select_still_timer = None
+                    self._select_pos_history.clear()
+                    self.status_bar.showMessage(
+                        "📍 Anchor set! Move to select area, then hold still to solve", 4000
+                    )
+            else:
+                # Moving — reset timer
+                self._select_still_timer = None
+
+        elif self._select_phase == 'dragging':
+            # Anchor confirmed — track rubber-band, wait for second hold-still
+            self._selection_end = (x, y)
+
+            if is_still:
+                if self._select_still_timer is None:
+                    self._select_still_timer = now
+                progress = min(
+                    (now - self._select_still_timer) / self.SELECT_STILL_TIMEOUT, 1.0
+                )
+                self._draw_select_ring(frame, (x, y), progress, (0, 120, 255), 'Solve')
+                if progress >= 1.0:
+                    # Finalize selection and trigger math solve
+                    self._select_phase = 'done'
+                    self._trigger_math_selection()
+            else:
+                self._select_still_timer = None
+
+        # Phase 'done': selection committed, nothing more to do
+
+    def _trigger_math_selection(self):
+        """Trigger OCR + math solve on the current rubber-band selection."""
+        if self._selection_start is None or self._selection_end is None:
+            return
+
+        sx, sy = self._selection_start
+        ex, ey = self._selection_end
+        w_sel = abs(ex - sx)
+        h_sel = abs(ey - sy)
+
+        if w_sel < 30 or h_sel < 30:
+            self.status_bar.showMessage(
+                "⚠️ Selected area too small — try dragging a larger region", 4000
+            )
+            self._select_phase = 'idle'
+            self._select_still_timer = None
+            self._select_pos_history.clear()
+            return
+
+        # Commit to drawing engine so the dashed rect persists on screen
+        self.drawing_engine.selection_start = self._selection_start
+        self.drawing_engine.selection_end = self._selection_end
+        self.drawing_engine.selection_active = True
+
+        if not self.ai_worker.is_busy():
+            region = self.drawing_engine.get_region(sx, sy, ex, ey)
+            if region is not None:
+                self.ai_worker.process_ocr_and_math(region)
+                self.status_bar.showMessage(
+                    f"🧮 Solving equation in selected area ({w_sel}×{h_sel}px)…", 5000
+                )
+            else:
+                self.status_bar.showMessage("⚠️ Selection area too small.", 3000)
+        else:
+            self.status_bar.showMessage("⏳ AI already processing — try again shortly", 3000)
+
+        self._math_mode = False  # Auto-deactivate after use
+        # Don't reset _selection_start/end here — drawing_engine has its own copies
+
+    def _draw_select_ring(self, frame, pos, progress, color, label):
+        """
+        Draw a selection-hold progress ring (same visual style as draw stillness ring).
+        color: BGR tuple, label: 'Anchor' or 'Solve'
+        """
+        x, y = int(pos[0]), int(pos[1])
+        radius = 28
+        intensity = 0.4 + 0.6 * progress
+        draw_color = tuple(int(c * intensity) for c in color)
+
+        # Background ring
+        cv2.circle(frame, (x, y), radius, (40, 40, 40), 2, cv2.LINE_AA)
+
+        # Filled progress arc
+        angle = int(progress * 360)
+        if angle > 0:
+            cv2.ellipse(
+                frame, (x, y), (radius, radius),
+                -90, 0, angle, draw_color, 3, cv2.LINE_AA
+            )
+
+        # Label + percentage
+        pct_text = f"{label} {int(progress * 100)}%"
+        text_size = cv2.getTextSize(pct_text, cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1)[0]
+        cv2.putText(
+            frame, pct_text,
+            (x - text_size[0] // 2, y + radius + 18),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.4, draw_color, 1, cv2.LINE_AA
+        )
 
     # =========================================================================
     #  Tool Callbacks
     # =========================================================================
 
     def _on_color_selected(self, index):
-        """Handle color selection."""
+        """Handle color selection (from header gesture)."""
         self.drawing_engine.set_color(index)
         self.drawing_engine.eraser_mode = False
         self.eraser_btn.setChecked(False)
-        self._highlight_color_button(index)
-
-    def _highlight_color_button(self, selected_index):
-        """Update color button borders to show selection."""
-        for i, btn in enumerate(self.color_buttons):
-            bgr = DrawingEngine.COLOR_LIST[i]
-            r, g, b = bgr[2], bgr[1], bgr[0]
-            if i == selected_index:
-                btn.setStyleSheet(f"""
-                    QPushButton {{
-                        background-color: rgb({r},{g},{b});
-                        border: 3px solid #ffffff;
-                        border-radius: 8px;
-                    }}
-                """)
-            else:
-                btn.setStyleSheet(f"""
-                    QPushButton {{
-                        background-color: rgb({r},{g},{b});
-                        border: 3px solid transparent;
-                        border-radius: 8px;
-                    }}
-                    QPushButton:hover {{
-                        border: 3px solid #ffffff;
-                    }}
-                """)
-
-    def _on_brush_size_changed(self, value):
-        """Handle brush size slider change."""
-        self.drawing_engine.set_brush_size(value)
-        self.size_label.setText(f"Size: {DrawingEngine.BRUSH_SIZES[value]}px")
 
     def _on_eraser_toggled(self):
         """Handle eraser button toggle."""

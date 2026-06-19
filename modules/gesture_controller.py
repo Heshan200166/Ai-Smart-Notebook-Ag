@@ -1,6 +1,6 @@
 """
-Gesture Controller Module — V6 (Pen Up/Down State Machine)
-============================================================
+Gesture Controller Module — V7 (Window-Based Stillness Detection)
+==================================================================
 Drawing uses a symmetrical hold-to-toggle system:
 
   1. Show index finger → enters draw mode (pen UP initially)
@@ -11,11 +11,14 @@ Drawing uses a symmetrical hold-to-toggle system:
   6. Hold still 1 second → pen goes DOWN again
   7. Repeat...
 
+Stillness detection uses a sliding window spread metric instead of
+frame-to-frame distance, making it immune to MediaPipe pinpoint jitter.
 Open palm gesture now overrides draw lock immediately.
 """
 
 import time
 import math
+import numpy as np
 from collections import deque
 
 
@@ -49,14 +52,17 @@ class GestureController:
     BUFFER_SIZE = 9
 
     # Frames needed to break out of a gesture via inertia
-    DRAW_EXIT_FRAMES = 3
-    ERASE_EXIT_FRAMES = 3
+    # Higher values = more stable, slower transitions
+    DRAW_EXIT_FRAMES = 6      # Draw is hard to exit — prevents accidental SELECT
+    ERASE_EXIT_FRAMES = 5
+    SELECT_EXIT_FRAMES = 5
     DEFAULT_EXIT_FRAMES = 3
 
-    # --- Stillness config ---
+    # --- Stillness config (window-based spread detection) ---
     STILLNESS_TIMEOUT = 1.0       # Seconds to hold still to toggle pen state
-    MOVEMENT_THRESHOLD = 8.0      # Pixels — below this = "still"
-    RESUME_THRESHOLD = 12.0       # Pixels — above this = "moving" (hysteresis)
+    POSITION_WINDOW_SIZE = 14     # Sliding window frames (~460ms @ 30fps)
+    STILL_RADIUS = 22.0           # Max spread (px) across window → hand is still
+    MOVE_RADIUS = 35.0            # Min spread (px) across window → hand is definitely moving
 
     def __init__(self):
         self.current_gesture = Gesture.NONE
@@ -88,10 +94,12 @@ class GestureController:
         # --- Pen state machine ---
         self.pen_state = PenState.UP        # Current pen state
         self.draw_paused = False             # True = don't draw this frame
-        self._last_draw_pos = None           # Last fingertip (x, y)
-        self._still_start_time = None        # When finger became still
-        self._is_still = False               # Currently in "still" state
-        self._pen_just_toggled = False       # Prevents immediate re-toggle
+        self._position_history = deque(maxlen=self.POSITION_WINDOW_SIZE)  # Sliding window
+        self._still_center = None           # Centroid of the still cluster
+        self._still_start_time = None       # When stillness began
+        self._is_still = False              # Currently in still state
+        self._pen_just_toggled = False      # Prevents immediate re-toggle
+        self._smoothed_movement = 0.0       # Legacy compatibility
 
     def recognize(self, finger_states):
         """
@@ -125,10 +133,17 @@ class GestureController:
                 self._index_down_count = 0
                 self._reset_pen_state()
                 # Fall through to normal gesture processing below
+            elif raw == Gesture.SELECT:
+                # SELECT while drawing — middle finger briefly up
+                # Count it but use higher threshold than NONE
+                self._index_down_count += 1
+                # Don't pause drawing for brief SELECT flickers
             elif not index:
+                # Index finger is truly down — count towards exit
                 self._index_down_count += 1
                 self.draw_paused = True
             else:
+                # Index is up = drawing — reset exit counter
                 self._index_down_count = 0
 
             # Exit draw lock if index has been down long enough
@@ -171,49 +186,55 @@ class GestureController:
     def update_draw_position(self, x, y):
         """
         Call every frame during draw mode with the fingertip position.
-        Manages the pen up/down state machine based on stillness.
+        Uses a sliding-window SPREAD metric to detect stillness — immune to
+        per-frame MediaPipe landmark jitter.
+
+        Instead of frame-to-frame distance (which spikes on noise), we track
+        the last N positions and measure the maximum deviation of any point
+        from the window centroid.  A truly still hand will cluster tightly
+        even with noisy landmarks; a moving hand will push spread above the
+        threshold reliably.
         """
         if not self._draw_active:
             return
 
         now = time.time()
+        self._position_history.append((x, y))
 
-        if self._last_draw_pos is None:
-            self._last_draw_pos = (x, y)
-            self._still_start_time = now
-            self._is_still = True  # Start as still — user needs to hold to begin
-            self._pen_just_toggled = False
+        # Need minimum frames before spread is meaningful
+        if len(self._position_history) < 4:
+            if self._still_start_time is None:
+                self._still_start_time = now
+                self._is_still = True
+            self.draw_paused = (self.pen_state != PenState.DOWN)
             return
 
-        # Calculate movement
-        dx = x - self._last_draw_pos[0]
-        dy = y - self._last_draw_pos[1]
-        distance = math.sqrt(dx * dx + dy * dy)
-        self._last_draw_pos = (x, y)
+        # Compute spread: max deviation of any window point from centroid
+        pts = np.array(list(self._position_history))
+        centroid = pts.mean(axis=0)
+        spread = float(np.linalg.norm(pts - centroid, axis=1).max())
 
-        # --- Stillness state machine ---
         if self._is_still:
-            if distance > self.RESUME_THRESHOLD:
-                # Finger started moving
+            if spread > self.MOVE_RADIUS:
+                # Clearly moving — exit still state
                 self._is_still = False
                 self._still_start_time = None
                 self._pen_just_toggled = False
+                self._still_center = None
             else:
                 # Still holding still — check timeout
                 if self._still_start_time is not None and not self._pen_just_toggled:
                     elapsed = now - self._still_start_time
                     if elapsed >= self.STILLNESS_TIMEOUT:
-                        # Toggle pen state!
                         self._toggle_pen()
                         self._pen_just_toggled = True
         else:
-            # Currently moving
-            if distance < self.MOVEMENT_THRESHOLD:
-                # Finger became still
+            # Moving — check if hand has come to rest
+            if spread < self.STILL_RADIUS:
                 self._is_still = True
                 self._still_start_time = now
                 self._pen_just_toggled = False
-            # else: still moving, nothing to do
+                self._still_center = centroid.copy()
 
         # Update draw_paused based on pen state
         self.draw_paused = (self.pen_state != PenState.DOWN)
@@ -229,10 +250,12 @@ class GestureController:
         """Reset all pen/stillness state."""
         self.pen_state = PenState.UP
         self.draw_paused = True
-        self._last_draw_pos = None
+        self._position_history.clear()
+        self._still_center = None
         self._still_start_time = None
         self._is_still = False
         self._pen_just_toggled = False
+        self._smoothed_movement = 0.0
 
     def get_stillness_progress(self):
         """
