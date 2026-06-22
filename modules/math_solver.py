@@ -49,6 +49,10 @@ class MathSolver:
         'g': '9', 'q': '9',
         'A': '4',
         'T': '7',
+        't': '+',          # '+' is very commonly misread as 't'
+        'f': '+',          # '+' is sometimes misread as 'f'
+        'y': 'x',          # Treat 'y' as 'x' to allow solving single-variable equations in y
+        'Y': 'x',
         '×': '*', '✕': '*', 'X': '*',
         '÷': '/',
         '−': '-', '–': '-', '—': '-',
@@ -109,6 +113,14 @@ class MathSolver:
         and multiple notation styles for operators.
         """
         result = text.strip()
+
+        # Handle common OCR misreads for equals sign: "==" or "::" or ":" or "::="
+        result = re.sub(r'==|::|::=', '=', result)
+        # If there's no '=' but we have a ':' or '::', replace it with '=' if surrounded by math terms
+        if '=' not in result:
+            result = re.sub(r'\s*:\s*(?=\d|x|y|a|b)', ' = ', result)
+            if '=' not in result:
+                result = re.sub(r':+', '=', result)
 
         # Handle percentage: "25% of 200" → "(25/100)*200"
         pct_match = re.match(r'(\d+(?:\.\d+)?)\s*%\s*(?:of\s+)?(\d+(?:\.\d+)?)', result, re.IGNORECASE)

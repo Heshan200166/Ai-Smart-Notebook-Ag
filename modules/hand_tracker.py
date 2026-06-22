@@ -263,33 +263,41 @@ class HandTracker:
                 self._finger_states = [False] * 5
                 self._finger_confidence = [0.0] * 5
 
-        # Draw landmarks
-        if raw_detected and draw:
-            h, w, _ = frame.shape
-            for hand_lms in self._result.hand_landmarks:
-                for connection in self.HAND_CONNECTIONS:
-                    start_lm = hand_lms[connection.start]
-                    end_lm = hand_lms[connection.end]
-                    start_pt = (int(start_lm.x * w), int(start_lm.y * h))
-                    end_pt = (int(end_lm.x * w), int(end_lm.y * h))
-                    cv2.line(frame, start_pt, end_pt, (0, 255, 200), 2, cv2.LINE_AA)
+        # Draw landmarks using SMOOTHED coords for rock-steady Phase 1 visuals
+        if draw and self.hand_detected and self._smoothed_coords is not None:
+            sm = self._smoothed_coords
 
-                for i, lm in enumerate(hand_lms):
-                    px, py = int(lm.x * w), int(lm.y * h)
-                    if i in self.FINGERTIP_IDS:
-                        cv2.circle(frame, (px, py), 8, (0, 255, 255), -1, cv2.LINE_AA)
-                        cv2.circle(frame, (px, py), 9, (255, 255, 255), 1, cv2.LINE_AA)
-                    else:
-                        cv2.circle(frame, (px, py), 4, (0, 200, 255), -1, cv2.LINE_AA)
+            # Draw connections from smoothed positions
+            for connection in self.HAND_CONNECTIONS:
+                s_idx, e_idx = connection.start, connection.end
+                start_pt = (int(sm[s_idx][0]), int(sm[s_idx][1]))
+                end_pt = (int(sm[e_idx][0]), int(sm[e_idx][1]))
+                cv2.line(frame, start_pt, end_pt, (0, 255, 200), 2, cv2.LINE_AA)
 
-                # Draw orientation indicator
-                if self.landmarks:
-                    wrist = self.landmarks[0]
-                    indicator_text = "INV" if self._hand_inverted else "NRM"
-                    indicator_color = (0, 165, 255) if self._hand_inverted else (0, 255, 0)
-                    cv2.putText(frame, indicator_text,
-                                (wrist[1] - 15, wrist[2] + 25),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.4, indicator_color, 1, cv2.LINE_AA)
+            # Draw joint markers with Phase 1 style
+            for i in range(21):
+                px, py = int(sm[i][0]), int(sm[i][1])
+                if i in self.FINGERTIP_IDS:
+                    cv2.circle(frame, (px, py), 8, (0, 255, 255), -1, cv2.LINE_AA)
+                    cv2.circle(frame, (px, py), 9, (255, 255, 255), 1, cv2.LINE_AA)
+                else:
+                    cv2.circle(frame, (px, py), 4, (0, 200, 255), -1, cv2.LINE_AA)
+
+            # Draw Phase 1 finger state indicators on fingertips (green = UP, red = DOWN)
+            states = self._finger_states
+            for fi, is_up in enumerate(states):
+                tx = int(sm[self.FINGERTIP_IDS[fi]][0])
+                ty = int(sm[self.FINGERTIP_IDS[fi]][1])
+                color = (0, 255, 0) if is_up else (0, 0, 255)
+                cv2.circle(frame, (tx, ty - 15), 5, color, -1, cv2.LINE_AA)
+
+            # Draw orientation indicator near wrist
+            wx, wy = int(sm[0][0]), int(sm[0][1])
+            indicator_text = "INV" if self._hand_inverted else "NRM"
+            indicator_color = (0, 165, 255) if self._hand_inverted else (0, 255, 0)
+            cv2.putText(frame, indicator_text,
+                        (wx - 15, wy + 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, indicator_color, 2, cv2.LINE_AA)
 
         return frame
 

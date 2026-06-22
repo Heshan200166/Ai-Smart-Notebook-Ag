@@ -123,7 +123,8 @@ class TextRecognizer:
 
         The canvas has colored ink on a black background, which is
         the opposite of what OCR expects (dark text on white).
-        This method inverts and enhances the image.
+        This method thresholds the digital ink, dilates it to connect and
+        bolden strokes, blurs/re-thresholds for smooth edges, and inverts it.
 
         Args:
             image: BGR canvas crop.
@@ -137,28 +138,26 @@ class TextRecognizer:
         else:
             gray = image.copy()
 
-        # Invert: black background → white background, colored ink → dark ink
-        inverted = cv2.bitwise_not(gray)
+        # Threshold to get white ink (255) on black background (0).
+        # Threshold at 2 to capture even very faint drawing stroke pixels.
+        _, binary = cv2.threshold(gray, 2, 255, cv2.THRESH_BINARY)
 
-        # Apply slight Gaussian blur to smooth jagged air-drawn strokes
-        blurred = cv2.GaussianBlur(inverted, (3, 3), 0)
-
-        # Adaptive thresholding for clean binary image
-        binary = cv2.adaptiveThreshold(
-            blurred, 255,
-            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-            cv2.THRESH_BINARY,
-            blockSize=11,
-            C=2
-        )
-
-        # Dilate slightly to connect broken strokes
-        kernel = np.ones((2, 2), np.uint8)
+        # Dilate the white ink to connect strokes and make them thicker/clearer
+        kernel = np.ones((3, 3), np.uint8)
         dilated = cv2.dilate(binary, kernel, iterations=1)
 
-        # Add white border padding (helps OCR with edge text)
+        # Apply a slight Gaussian blur to smooth the edges of the strokes
+        blurred = cv2.GaussianBlur(dilated, (3, 3), 0)
+
+        # Re-threshold to get sharp edges
+        _, sharp = cv2.threshold(blurred, 127, 255, cv2.THRESH_BINARY)
+
+        # Invert to get black ink (0) on white background (255)
+        inverted = cv2.bitwise_not(sharp)
+
+        # Add white border padding (helps EasyOCR detect text near borders)
         padded = cv2.copyMakeBorder(
-            dilated, 20, 20, 20, 20,
+            inverted, 30, 30, 30, 30,
             cv2.BORDER_CONSTANT, value=255
         )
 

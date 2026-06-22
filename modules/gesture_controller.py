@@ -275,13 +275,17 @@ class GestureController:
         _, index, middle, ring, pinky = states
         non_thumb_up = sum([index, middle, ring, pinky])
 
-        # OPEN PALM: 3 or 4 non-thumb fingers up → Clear
-        if non_thumb_up >= 3 and index and middle and ring:
+        # OPEN PALM: 3 or 4 non-thumb fingers up → Clear (Phase 1 rule: index + middle + at least one other)
+        if non_thumb_up >= 3 and index and middle:
             return Gesture.CLEAR
 
-        # INDEX ONLY: Just index up → Draw
-        if index and not middle and not ring and not pinky:
-            return Gesture.DRAW
+        # ROCK ON (Index + Pinky) → Save
+        if index and pinky and not middle and not ring:
+            return Gesture.SAVE
+
+        # PINKY ONLY → Undo
+        if pinky and not index and not middle and not ring:
+            return Gesture.UNDO
 
         # PEACE: Index + Middle, no ring/pinky → Select
         if index and middle and not ring and not pinky:
@@ -291,13 +295,9 @@ class GestureController:
         if middle and not index and not ring and not pinky:
             return Gesture.ERASE
             
-        # PINKY ONLY → Undo
-        if pinky and not index and not middle and not ring:
-            return Gesture.UNDO
-            
-        # ROCK ON (Index + Pinky) → Save
-        if index and pinky and not middle and not ring:
-            return Gesture.SAVE
+        # INDEX ONLY: Just index up (ring/pinky ignored like in Phase 1) → Draw
+        if index and not middle:
+            return Gesture.DRAW
 
         return Gesture.NONE
 
